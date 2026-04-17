@@ -1,99 +1,176 @@
+"""
+Gym 包装环境 / Gymnasium-based Environments
+-----------------------------------------------
+封装 FrozenLake / Sokoban / CartPole 等经典离散控制环境到"文本 in / 文本 out"的接口。
+
+## RAGEN 对齐（路径 A）
+
+为对齐 RAGEN 论文对多步环境的设计，FrozenLakeEnv / SokobanEnv 支持 **一次回复多个动作**：
+    <answer>Left || Up || Up</answer>
+-> env 在本 turn 内依次执行 3 个原子 step（上层 BaseEnv.step 负责循环与聚合）。
+
+- 解析：子类覆盖 `_parse_action_sequence`，按 `||` 切分 `<answer>` 内容，对每个 token 跑
+  `_parse_action`（单动作解析）。
+- 执行：单个原子动作由 `_step_atomic(gym_action)` 负责，不再需要自己推进 `current_step`。
+
+CartPole 保持"一次回复 = 一个动作"的旧行为（它是连续平衡控制，批量动作没意义）。
+"""
+
+import re
+from typing import Any, List, Optional, Tuple
+
 import gymnasium as gym
-from typing import Optional, Tuple, Any
+
 from .base_env import BaseEnv
 
 
+# ---------------------------------------------------------------------------
+# 通用基类：gymnasium.make 出来的离散空间环境
+# ---------------------------------------------------------------------------
+
 class GymEnvWrapper(BaseEnv):
     """
-    Gymnasium 环境的通用包装类
-    将离散/连续空间的Gym环境转化为基于文本的LLM交互接口。
+    Gymnasium 环境的通用包装类。
+
+    子类需要提供（至少）：
+        - `_parse_action(text) -> Optional[int]`：把单 token 解析成 gym 整数动作；
+          如果无法解析返回 None（会被 `_step_atomic` 当成 invalid 处理）。
+        - `_parse_action_sequence(text) -> List[Optional[int]]`：如需支持 `||`，覆盖它。
+        - `get_valid_actions()` / `get_env_instruction()`。
     """
+
     def __init__(self, config: Any):
         super().__init__(config)
         # env_name 为 EnvConfig 必填字段；kwargs 是预留扩展字段（dataclass 中默认为空 dict）。
         self.env_name = config.env_name
         env_kwargs = config.kwargs
-        self.env = gym.make(self.env_name, **env_kwargs)
-        
+        # 显式把 BaseEnv.max_steps 传给 gymnasium 的 TimeLimit wrapper，消除"我们 BaseEnv
+        # 的 max_steps 计数" 与 "gym spec 默认 max_episode_steps（FrozenLake=100, CartPole=500）"
+        # 两套计数器共存的隐患 —— 严格遵循"单一真相"原则。
+        self.env = gym.make(
+            self.env_name,
+            max_episode_steps=self.max_steps,
+            **env_kwargs,
+        )
+
     def reset(self, seed: Optional[int] = None, **kwargs) -> Tuple[str, dict]:
         super().reset(seed=seed, **kwargs)
         obs, info = self.env.reset(seed=seed, **kwargs)
         return self._format_obs(obs), info
 
-    def step(self, action: str) -> Tuple[str, float, bool, bool, dict]:
-        super().step(action)
-        
-        # 将文本动作转化为Gym所需动作
-        gym_action = self._parse_action(action)
-        
-        # 如果解析失败，可以直接返回负奖励或当前状态
+    def _step_atomic(self, gym_action: Optional[int]) -> Tuple[str, float, bool, bool, dict]:
         if gym_action is None:
-            return "Invalid action. Please output the action inside an <answer> tag.", -0.1, False, False, {"error": "Invalid action format.", "action_is_effective": False}
-            
+            return (
+                "Invalid action. Please output the action inside an <answer> tag.",
+                -0.1,
+                False,
+                False,
+                {
+                    "error": "Invalid action format.",
+                    "action_is_valid": False,
+                    "action_is_effective": False,
+                },
+            )
+
         obs, reward, terminated, truncated, info = self.env.step(gym_action)
-        
-        if self.current_step >= self.max_steps:
-            truncated = True
-            
-        # 增加一些 RAGEN 兼容的 info 字段
+        # current_step 检查由 BaseEnv.step 统一处理，这里不再提前 truncated=True
+        info = dict(info) if isinstance(info, dict) else {}
         info["action_is_valid"] = True
         if "action_is_effective" not in info:
             info["action_is_effective"] = True
-            
-        return self._format_obs(obs), float(reward), terminated, truncated, info
+        return self._format_obs(obs), float(reward), bool(terminated), bool(truncated), info
 
     def render(self) -> Any:
         return self.env.render()
-        
+
     def close(self):
         self.env.close()
 
     def _format_obs(self, obs: Any) -> str:
-        """将数值型Observation转化为描述性文本"""
+        """将数值型 observation 转化为描述性文本。"""
         return f"Observation: {obs}"
-        
-    def _parse_action(self, action: str) -> Any:
+
+    def _parse_action(self, action_text: str) -> Any:
         """
-        将文本动作转化为数值动作（子类可复写）
-        默认提供提取 <answer>...</answer> 的能力
+        默认：提取 `<answer>...</answer>` 里的内容，尝试转 int，失败返回 None。
+        子类通常会覆盖它实现方向词匹配等。
         """
-        import re
-        match = re.search(r'<answer>(.*?)</answer>', action, re.DOTALL)
-        content = match.group(1).strip() if match else action.strip()
+        match = re.search(r'<answer>(.*?)</answer>', action_text, re.DOTALL)
+        content = match.group(1).strip() if match else action_text.strip()
         try:
             return int(content)
-        except ValueError:
+        except (ValueError, TypeError):
             return None
 
     def get_valid_actions(self) -> str:
-        """
-        获取当前有效的动作列表或动作空间描述，以文本形式返回给LLM参考。
-        """
-        pass
+        raise NotImplementedError
 
+
+# ---------------------------------------------------------------------------
+# 共享工具：把 `<answer>A || B || C</answer>` 切成 ["A", "B", "C"]
+# ---------------------------------------------------------------------------
+
+def _split_action_tokens(action_text: str) -> List[str]:
+    """
+    从完整 LLM 回复中抽取 `<answer>` 内容（没有则退化成全文），按 `||` 切分。
+    保证返回至少 1 个元素：
+        - 若 `<answer>` 内容为空或无 `<answer>` 且全文为空字符串，则返回 `[""]`
+          （后续 `_parse_action` 会把空字符串解析成 None，触发 invalid 分支）。
+    """
+    match = re.search(r'<answer>(.*?)</answer>', action_text, re.DOTALL)
+    content = match.group(1).strip() if match else action_text.strip()
+
+    if "||" in content:
+        tokens = [t.strip() for t in content.split("||")]
+        tokens = [t for t in tokens if t]  # 去空白 token
+        if not tokens:
+            return [""]
+        return tokens
+    return [content]
+
+
+# ---------------------------------------------------------------------------
+# CartPole：连续平衡控制，保持单动作语义
+# ---------------------------------------------------------------------------
 
 class CartPoleEnv(GymEnvWrapper):
-    """CartPole特定环境封装"""
+    """CartPole 封装。连续平衡任务 → 仅单动作语义，不支持 `||` 序列。"""
+
     def __init__(self, config: Any):
         config.env_name = 'CartPole-v1'
         super().__init__(config)
 
     def _format_obs(self, obs: Any) -> str:
         cart_pos, cart_vel, pole_angle, pole_vel = obs
-        return (f"Cart Position: {cart_pos:.4f}, Cart Velocity: {cart_vel:.4f}, "
-                f"Pole Angle: {pole_angle:.4f}, Pole Velocity at Tip: {pole_vel:.4f}")
+        return (
+            f"Cart Position: {cart_pos:.4f}, Cart Velocity: {cart_vel:.4f}, "
+            f"Pole Angle: {pole_angle:.4f}, Pole Velocity at Tip: {pole_vel:.4f}"
+        )
 
     def get_valid_actions(self) -> str:
         return "Valid actions are: 0 (Push cart to the left), 1 (Push cart to the right)."
 
+    def get_env_instruction(self) -> str:
+        return (
+            "You are controlling a CartPole to keep the pole balanced. "
+            "Each turn you output **one** action. "
+            "Wrap the action number inside <answer>...</answer>. "
+            "Example: <think>The pole is tilting right, push right.</think><answer>1</answer>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sokoban：RAGEN 主力多步规划环境
+# ---------------------------------------------------------------------------
 
 class SokobanEnv(GymEnvWrapper):
     """
-    Sokoban (推箱子) 环境封装
-    作为 RAGEN-main 中最核心的多步空间推理与规划测试床
+    Sokoban (推箱子) 环境封装。RAGEN 中的多步空间推理测试床。
+
+    对齐 RAGEN 论文的 `||` 动作序列：一次回复可以一次性规划多步推箱子。
     """
+
     def __init__(self, config: Any):
-        # 如果尚未安装 gym-sokoban，需要提醒用户安装
         try:
             import sys
             import os
@@ -101,109 +178,129 @@ class SokobanEnv(GymEnvWrapper):
             original_stderr = sys.stderr
             sys.stderr = open(os.devnull, 'w')
             try:
-                import gym_sokoban
+                import gym_sokoban  # noqa: F401
             finally:
                 sys.stderr.close()
                 sys.stderr = original_stderr
         except ImportError:
             import logging
             logging.warning("gym_sokoban is not installed. Please run `pip install gym-sokoban`")
-            
-        from .base_env import BaseEnv
+
+        # 跳过 GymEnvWrapper.__init__ 的 gym.make（Sokoban 要手动构造）
         BaseEnv.__init__(self, config)
-        
+
         # ----------------------------------------------------
-        # 直接配置推箱子的参数 (对齐 RAGEN 论文实验配置)
-        # 默认使用 SimpleSokoban (6x6 网格, 1 个箱子)
-        # 如果要测 LargerSokoban, 可以改为: dim_room=(8, 8), num_boxes=2
+        # 对齐 RAGEN 默认 SimpleSokoban (6x6, 1 个箱子)
+        # 如需 LargerSokoban 改成 dim_room=(8,8), num_boxes=2
         # ----------------------------------------------------
-        self.dim_room = (6, 6)     # (dim_x, dim_y)
-        self.num_boxes = 1         # 箱子数量
-        # 尊重 EnvConfig.max_steps；BaseEnv.__init__ 已经设好，这里保持不覆盖
-        # （如果用户传入 max_steps，就使用用户值；否则沿用 BaseEnv 默认 100）
-        
+        self.dim_room = (6, 6)
+        self.num_boxes = 1
+
         from gym_sokoban.envs.sokoban_env import SokobanEnv as CoreSokobanEnv
-        
-        # 初始化核心环境
         self.env = CoreSokobanEnv(
             dim_room=self.dim_room,
             max_steps=self.max_steps,
-            num_boxes=self.num_boxes
+            num_boxes=self.num_boxes,
         )
-        
-        # 对应 RAGEN-main 中的网格字符映射
+
         self.GRID_LOOKUP = {
-            0: "#", # 墙壁 (wall)
-            1: "_", # 空地 (empty)
-            2: "O", # 目标点 (target)
-            3: "√", # 箱子在目标点上 (box on target)
-            4: "X", # 箱子 (box)
-            5: "P", # 玩家 (player)
-            6: "S"  # 玩家在目标点上 (player on target)
+            0: "#",  # wall
+            1: "_",  # empty
+            2: "O",  # target
+            3: "√",  # box on target
+            4: "X",  # box
+            5: "P",  # player
+            6: "S",  # player on target
         }
 
     def reset(self, seed: Optional[int] = None, **kwargs) -> Tuple[str, dict]:
-        from .base_env import BaseEnv
         BaseEnv.reset(self, seed=seed, **kwargs)
         if seed is not None:
             self.env.seed(seed)
         obs = self.env.reset()
         return self._format_obs(obs), {}
 
-    def step(self, action: str) -> Tuple[str, float, bool, bool, dict]:
-        from .base_env import BaseEnv
-        BaseEnv.step(self, action)
-        
-        gym_action = self._parse_action(action)
+    def _step_atomic(self, gym_action: Optional[int]) -> Tuple[str, float, bool, bool, dict]:
         if gym_action is None:
-            return "Invalid action. Please output the action inside an <answer> tag.", -0.1, False, False, {"error": "Invalid action format.", "action_is_effective": False}
-            
+            return (
+                "Invalid action. Please output the action inside an <answer> tag.",
+                -0.1,
+                False,
+                False,
+                {
+                    "error": "Invalid action format.",
+                    "action_is_valid": False,
+                    "action_is_effective": False,
+                },
+            )
+
+        # gym_sokoban 返回 4 元组 (obs, reward, done, info)
         obs, reward, done, info = self.env.step(gym_action)
-        
-        terminated = done
-        truncated = False
-        if self.current_step >= self.max_steps:
-            truncated = True
-            
+        info = dict(info) if isinstance(info, dict) else {}
         info["action_is_valid"] = True
         if "action_is_effective" not in info:
             info["action_is_effective"] = True
-            
+
+        # gym_sokoban 把"推完所有箱子"和"步数用完"都写成 done=True，
+        # 但 RL 语义下这是两件事（terminated vs truncated）。
+        # 从 info 里两个字段拆开（仅在 done=True 时 sokoban 才写这两个键）：
+        #   info["all_boxes_on_target"] → True 表示任务成功完成
+        #   info["maxsteps_used"]       → True 表示因 max_steps 超时
+        terminated = False
+        truncated = False
+        if done:
+            all_boxes = bool(info.get("all_boxes_on_target", False))
+            if all_boxes:
+                terminated = True
+                info["is_success"] = True
+            else:
+                # done=True 但没全部在目标上 → 只能是超时
+                truncated = True
+                info["is_success"] = False
         return self._format_obs(obs), float(reward), terminated, truncated, info
 
     def _format_obs(self, obs: Any) -> str:
         import numpy as np
         room_state = self.env.unwrapped.room_state
         room_fixed = self.env.unwrapped.room_fixed
-        
-        # 如果玩家(5)站在目标点(2)上，标记为6
+
+        # 玩家(5) 站在目标(2) 上时标记为 6
         room = np.where((room_state == 5) & (room_fixed == 2), 6, room_state)
-        
         grid_str = ""
         for row in room.tolist():
             grid_str += "".join([self.GRID_LOOKUP.get(cell, "?") for cell in row]) + "\n"
-            
         return grid_str.strip()
 
     def get_valid_actions(self) -> str:
         return (
-            "Valid actions are: 1 (Push Up), 2 (Push Down), 3 (Push Left), 4 (Push Right). "
-            "Please output the action number inside an <answer> tag."
+            "Valid actions: 1=Up, 2=Down, 3=Left, 4=Right. "
+            "You may output a sequence separated by '||'. "
+            "Example: <answer>Up || Right || Right</answer>"
         )
 
-    def _parse_action(self, action: str) -> Optional[int]:
-        """
-        解析 Sokoban 动作 (在 gym_sokoban 中 1: Push Up, 2: Push Down, 3: Push Left, 4: Push Right)。
-        同样先按数字解析，再按方向词 + word boundary 匹配。
-        """
-        # 调用父类提取 <answer> 内容
-        content = super()._parse_action(action)
-        if isinstance(content, int) and 1 <= content <= 4:
-            return content
+    def get_env_instruction(self) -> str:
+        return (
+            "You are solving Sokoban. Push every box (X) onto a target (O). "
+            "You can push a box only by walking towards it; you cannot pull or walk "
+            "through walls. When a box sits on a target it shows as √. The player is P "
+            "(S when standing on a target).\n"
+            "**Answer format**: put a sequence of moves inside <answer>...</answer>, "
+            "separated by `||`. Words (Up/Down/Left/Right) or numbers (1-4) both work.\n"
+            "Example: <think>I need to push the box right then go up.</think>"
+            "<answer>Right || Right || Up</answer>"
+        )
 
-        import re
-        match = re.search(r'<answer>(.*?)</answer>', action, re.DOTALL)
-        act_str = match.group(1).strip().lower() if match else action.strip().lower()
+    def _parse_action_sequence(self, action_text: str) -> List[Optional[int]]:
+        tokens = _split_action_tokens(action_text)
+        return [self._parse_action(tok) for tok in tokens]
+
+    def _parse_action(self, action_text: str) -> Optional[int]:
+        """
+        解析 Sokoban 单动作（1=Up, 2=Down, 3=Left, 4=Right）。
+        既接受 "<answer>2</answer>" / "<answer>Up</answer>" 的完整 text，也接受 "Up" / "2" 的裸 token。
+        """
+        match = re.search(r'<answer>(.*?)</answer>', action_text, re.DOTALL)
+        act_str = match.group(1).strip().lower() if match else action_text.strip().lower()
 
         if act_str.isdigit():
             num = int(act_str)
@@ -218,72 +315,87 @@ class SokobanEnv(GymEnvWrapper):
         return None
 
 
+# ---------------------------------------------------------------------------
+# FrozenLake：RAGEN 另一个核心多步规划环境
+# ---------------------------------------------------------------------------
+
 class FrozenLakeEnv(GymEnvWrapper):
-    """FrozenLake特定环境封装，对齐 RAGEN 网格化文本渲染"""
+    """
+    FrozenLake 封装，对齐 RAGEN 网格化文本渲染 + `||` 多动作序列。
+
+    默认使用 RAGEN 主流设置：4x4 地图 + is_slippery=True（打滑）。
+    """
+
+    # gymnasium FrozenLake 的离散动作：0=Left, 1=Down, 2=Right, 3=Up
+    _WORD_TO_GYM = {"left": 0, "down": 1, "right": 2, "up": 3}
+
     def __init__(self, config: Any):
-        # is_slippery / map_name 属于 FrozenLake **环境内部超参**，不是 EnvConfig 的必填字段。
-        # 在 EnvConfig 未显式挂载时使用 RAGEN 的默认取值（is_slippery=True, map_name="4x4"）。
-        is_slippery = getattr(config, 'is_slippery', True)
+        # is_slippery / map_name 是 FrozenLake 内部超参，不强制进 EnvConfig。
+        is_slippery = getattr(config, 'is_slippery', False)
         config.env_name = 'FrozenLake-v1'
         config.kwargs = {"is_slippery": is_slippery, "map_name": "4x4"}
         super().__init__(config)
-        
+
         self.MAP_LOOKUP = {b"S": 1, b"F": 1, b"H": 2, b"G": 3}
-        self.GRID_LOOKUP = {0:"P", 1:"_", 2:"O", 3:"G", 4:"X", 5:"√"}
-        
+        self.GRID_LOOKUP = {0: "P", 1: "_", 2: "O", 3: "G", 4: "X", 5: "√"}
+
     def _format_obs(self, obs: Any) -> str:
-        # 获取底层环境的网格信息
         import numpy as np
         desc = self.env.unwrapped.desc.copy()
-        
-        # 0. 提取当前玩家坐标 (row, col)
+
         ncol = self.env.unwrapped.ncol
         player_row, player_col = obs // ncol, obs % ncol
-        
-        # 1. 数字化网格
+
         room = np.vectorize(lambda x: self.MAP_LOOKUP.get(x, 1))(desc)
-        
-        # 2. 标记玩家位置
+
         if desc[player_row, player_col] == b'H':
-            room[player_row, player_col] = 4 # X 掉进洞
+            room[player_row, player_col] = 4   # X 掉进洞
         elif desc[player_row, player_col] == b'G':
-            room[player_row, player_col] = 5 # √ 到达目标
+            room[player_row, player_col] = 5   # √ 到达目标
         else:
-            room[player_row, player_col] = 0 # P 玩家
-            
-        # 3. 转化为字符画
+            room[player_row, player_col] = 0   # P 玩家
+
         grid_str = '\n'.join(''.join(self.GRID_LOOKUP.get(cell, "?") for cell in row) for row in room)
         return grid_str
-        
+
     def get_valid_actions(self) -> str:
-        return "Valid actions are: 1 (Left), 2 (Down), 3 (Right), 4 (Up). Output action in <answer> tag."
-        
-    def _parse_action(self, action: str) -> Optional[int]:
-        """
-        解析 FrozenLake 动作：
-        1. 先尝试提取 <answer> 标签中的内容
-        2. 如果内容能转为合法数字 (1-4)，按数字分支返回
-        3. 否则把内容转小写，严格匹配 left/down/right/up（使用 word boundary 避免 "step 12" 误匹配 "1" 的歧义）
-        """
-        # 调用父类先抽离出 <answer> 中的内容
-        content = super()._parse_action(action)
-        if isinstance(content, int) and 1 <= content <= 4:
-            return content - 1  # Gym 内部是 0,1,2,3
+        return (
+            "Valid actions: 1=Left, 2=Down, 3=Right, 4=Up. "
+            "You may output a sequence separated by '||'. "
+            "Example: <answer>Right || Right || Down</answer>"
+        )
 
-        import re
-        match = re.search(r'<answer>(.*?)</answer>', action, re.DOTALL)
-        act_str = match.group(1).strip().lower() if match else action.strip().lower()
+    def get_env_instruction(self) -> str:
+        return (
+            "You are solving FrozenLake. Navigate from the player (P) to the goal (G) "
+            "while avoiding holes (O). The ice is slippery, so you may occasionally "
+            "slide in an unintended direction — plan a sequence of moves to leave "
+            "room for slips.\n"
+            "**Answer format**: put a sequence of moves inside <answer>...</answer>, "
+            "separated by `||`. Words (Left/Down/Right/Up) or numbers (1-4) both work.\n"
+            "Example: <think>The goal is to the lower right. I'll head right then down.</think>"
+            "<answer>Right || Right || Down || Down</answer>"
+        )
 
-        # 优先按纯数字匹配：若 act_str 本身就是 "1"/"2"/"3"/"4"，直接返回
+    def _parse_action_sequence(self, action_text: str) -> List[Optional[int]]:
+        tokens = _split_action_tokens(action_text)
+        return [self._parse_action(tok) for tok in tokens]
+
+    def _parse_action(self, action_text: str) -> Optional[int]:
+        """
+        解析 FrozenLake 单动作，返回 gym 动作索引 0-3。
+        既接受 "<answer>Right</answer>" 的完整 text，也接受 "Right" / "3" 的裸 token。
+        """
+        match = re.search(r'<answer>(.*?)</answer>', action_text, re.DOTALL)
+        act_str = match.group(1).strip().lower() if match else action_text.strip().lower()
+
         if act_str.isdigit():
             num = int(act_str)
             if 1 <= num <= 4:
-                return num - 1
+                return num - 1  # 1-4 (用户可读) → 0-3 (gym 内部)
             return None
 
-        # 再按方向词匹配，使用 \b 防止 "left" 误匹配 "leftover"、或 "2" 误匹配 "12"
-        word_map = {"left": 0, "down": 1, "right": 2, "up": 3}
-        for k, v in word_map.items():
+        for k, v in self._WORD_TO_GYM.items():
             if re.search(rf'\b{k}\b', act_str):
                 return v
         return None

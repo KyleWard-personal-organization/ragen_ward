@@ -61,11 +61,23 @@ ragen_ward/
 - **训练流程 (`scripts/train.py`)**：完整 StarPO/PureRL 框架 + argparse 暴露所有超参。
 - **评估流程 (`scripts/evaluate.py`)**：剥离训练组件，只做在线推理，可使用远程 API 做能力对齐。
 
-### 2. 统一的环境接口 (BaseEnv)
-所有环境在输出给模型时都统一被转化为**纯文本的自然语言描述**。
+### 2. 统一的环境接口 (BaseEnv) + **多动作序列（RAGEN 对齐）**
+
+所有环境对 LLM 都是 **纯文本 in / 纯文本 out**，并按 RAGEN 论文约定支持 **一次回复多个原子动作**：
+
 - `reset()` → 初始文本描述 + info dict
-- `step(action)` → (文本观测, reward, terminated, truncated, info)，接收模型完整回复并内部解析动作。
-- `get_valid_actions()` → 合法动作空间的文本提示，协助模型理解当前可执行选项。
+- `step(action_text)` → (final_obs, total_reward, terminated, truncated, info)
+
+`step` 的内部做三件事：
+1. `_parse_action_sequence(action_text)` 把一次 LLM 回复切成原子动作列表（例如 `<answer>Right || Down || Down</answer>` → `[Right, Down, Down]`）。
+2. 依次调用 `_step_atomic(atom)` 直到 terminated / truncated / 序列跑完；`current_step` 按原子动作计数，与 `--max_env_steps` 做 truncation 比较。
+3. reward 累加、obs 取最后一步、info 合并（附带 `executed_action_count` / `requested_action_count` 便于诊断）。
+
+这与 RAGEN-main `config/envs.yaml` 的 `max_actions_per_traj=10` + `env_instruction` 示例（如 `<answer>Left || Up || Up</answer>`）**在语义与协议层完全对齐**。
+
+单轮任务（Bandit / Math）继承默认行为 —— 一次回复解析成 1 个 token，`_step_atomic` 立即 `terminated=True`，循环一轮就退出。
+
+每个环境另有一个 `get_env_instruction()`，返回 RAGEN 风格的"玩法 + 多动作答题示例"。trainer **只在第一轮 user message** 注入它一次（避免 context 膨胀）。
 
 ### 3. StarPO 训练器 (StarPOTrainer)
 区别于单步 RL，本训练器采用**轨迹级（Trajectory-Level）**的管理方式：
@@ -157,10 +169,10 @@ python scripts/train.py `
 | 运行 | `--exp_name` | `train_default` | 实验名，用于日志 / checkpoint 目录命名 |
 | 运行 | `--seed` | `42` | 随机种子（random / numpy / torch 全 seed 同步设置） |
 | 环境 | `--env` | `frozenlake` | math / cartpole / frozenlake / sokoban / bandit |
-| 环境 | `--max_env_steps` | `5` | 每个 episode 的最大 step 数 |
+| 环境 | `--max_env_steps` | `10` | 每个 episode 的最大**原子 env step** 数（对齐 RAGEN `max_actions_per_traj=10`；模型一次回复若含 `A \|\| B \|\| C` 就消耗 3 个 step） |
 | Agent | `--model` | `Qwen/Qwen2.5-0.5B-Instruct` | 模型路径或 HF repo 名 |
-| Agent | `--temperature` | `0.7` | 采样温度 |
-| Agent | `--max_new_tokens` | `512` | 单次生成 token 上限 |
+| Agent | `--temperature` | `1.0` | 采样温度（与 RAGEN 训练配置对齐） |
+| Agent | `--max_new_tokens` | `256` | 单次生成 token 上限 |
 | Agent | `--system_prompt` | `"You are a helpful reinforcement learning agent."` | 系统提示 |
 | 训练 | `--trainer` | `starpo` | starpo / pure |
 | 训练 | `--algo` | `ppo` | ppo / grpo |
@@ -174,7 +186,7 @@ python scripts/train.py `
 | RAGEN | `--variance_filter_ratio` | `0.25` | StarPO 方差过滤保留比例 |
 | RAGEN | `--use_format_reward / --no_format_reward` | on | 是否启用格式惩罚 |
 | RAGEN | `--format_penalty` | `-0.1` | 格式错误的负奖励 |
-| RAGEN | `--max_turn` | `5` | 多轮交互最大 turn 数（单轮任务无效） |
+| RAGEN | `--max_turn` | `3` | 每条 trajectory 最多调用 LLM 的次数（RAGEN `agent_proxy.max_turn`）。与 `--max_env_steps` **两层独立截断**，任一触发即 truncate。RAGEN 主力 FrozenLake/Sokoban 用 `1`（0.5B 小模型 + 1600 rollout 配置下过于严苛，默认 3 给模型几次试错空间）。单轮任务（Bandit/Math）第一个 atomic step 就 terminated，不受影响。 |
 | RL | `--learning_rate` | `1e-6` | AdamW 学习率 |
 | RL | `--ppo_epochs` | `1` | 每批数据更新轮数 |
 | RL | `--mini_batch_size` | `2` | 梯度更新样本数 |
@@ -197,8 +209,15 @@ python scripts/train.py `
 
 ### 接新环境
 1. `envs/` 下新建 `my_env.py`，继承 `BaseEnv`。
-2. 实现 `reset/step/get_valid_actions`；step 接收自然语言，内部解析动作（可参考 `FrozenLakeEnv._parse_action`，支持数字 + word boundary 双模式匹配）。
-3. 在 `envs/__init__.py` 的 `make_env` 注册。
+2. 必须实现：
+   - `reset(seed, **kwargs)`：记得开头调 `super().reset(seed=seed)` 把 `current_step` 清零。
+   - `_step_atomic(atomic_action)`：**只管一个原子动作**，不要自己 `current_step += 1`（`BaseEnv.step` 会统一维护）。
+   - `get_valid_actions()`：每轮都会提示给模型的动作描述。
+3. 视需要覆盖：
+   - `_parse_action(text)`：单 token 解析（默认透传字符串）。
+   - `_parse_action_sequence(text)`：**支持 `||` 多动作就在这里处理**。可参考 `FrozenLakeEnv` / `SokobanEnv` 的实现，复用 `_split_action_tokens` 工具函数。
+   - `get_env_instruction()`：给模型看的玩法说明（含多动作答题示例），只在 trajectory 第一轮 user message 注入。
+4. 在 `envs/__init__.py` 的 `make_env` 注册。
 
 ### 接新 RL 算法
 1. `rl_algos/` 下新建 `my_algo.py`，继承 `BaseRLAlgo`。

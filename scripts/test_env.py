@@ -93,7 +93,7 @@ def test_sokoban_env():
 def main():
     parser = argparse.ArgumentParser(description="Test environment wrappers.")
     parser.add_argument("--env", type=str, choices=["math", "frozenlake", "bandit", "sokoban", "all"], 
-                        default="all", help="Which environment to test")
+                        default="frozenlake", help="Which environment to test")
     args = parser.parse_args()
     
     if args.env == "math" or args.env == "all":

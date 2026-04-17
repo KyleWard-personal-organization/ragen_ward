@@ -63,6 +63,9 @@ class StarPOTrainer:
         self.format_penalty = rcfg.format_penalty
         self.variance_filter_ratio = rcfg.variance_filter_ratio
         self.prompt_batch_size = rcfg.prompt_batch_size
+        # LLM turn 级预算，和 env.max_steps（原子 env step 级预算）是两层独立截断。
+        # 任一触发 → truncated=True，episode 结束。RAGEN 主力 FrozenLake/Sokoban = 1。
+        self.max_turn = rcfg.max_turn
 
         # ---- 训练循环超参 ----
         self.total_training_steps = config.total_training_steps
@@ -83,7 +86,8 @@ class StarPOTrainer:
         logger.info(
             f"Initialized StarPOTrainer | total_training_steps={self.total_training_steps} "
             f"eval_interval={self.eval_interval} num_rollouts={self.num_rollouts} "
-            f"variance_filter_ratio={self.variance_filter_ratio} prompt_batch_size={self.prompt_batch_size}"
+            f"max_turn={self.max_turn} variance_filter_ratio={self.variance_filter_ratio} "
+            f"prompt_batch_size={self.prompt_batch_size}"
         )
 
     # ----------------------------------------------------------------
@@ -104,14 +108,38 @@ class StarPOTrainer:
         """对给定 seed 采样一条完整 trajectory。"""
         obs, info = self.env.reset(seed=seed)
         system_prompt = self.agent.config.system_prompt
+
+        # RAGEN 风格：第一轮 user message 里夹带环境玩法说明（含多动作序列示例）。
+        # 后续 turn 不再重复注入，避免 context 累积过快。
+        env_instruction = self.env.get_env_instruction()
+        first_user = ""
+        if env_instruction:
+            first_user = env_instruction.rstrip() + "\n\n"
+        first_user += f"{obs}\n{self.env.get_valid_actions()}\nPlease reason step by step."
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{obs}\n{self.env.get_valid_actions()}\nPlease reason step by step."},
+            {"role": "user", "content": first_user},
         ]
 
         trajectory: List[Dict[str, Any]] = []
         terminated, truncated = False, False
+        turn_idx = 0  # 已完成的 LLM turn 数
+
         while not (terminated or truncated):
+            # ---- Turn-level 硬截断（RAGEN `agent_proxy.max_turn` 对齐） ----
+            # 在进入下一次 chat_request 之前判定：如果已经用满 max_turn，
+            # 就把上一条 entry 标注为 truncated-by-agent-budget 并退出循环。
+            if 0 < self.max_turn <= turn_idx:
+                if trajectory:
+                    trajectory[-1]["truncated"] = True
+                    last_info = trajectory[-1].get("info") or {}
+                    last_info["truncated_reason"] = "max_turn_reached"
+                    last_info["max_turn"] = self.max_turn
+                    trajectory[-1]["info"] = last_info
+                truncated = True
+                break
+
             response = self.agent.chat_request(messages)
 
             step_penalty = 0.0
@@ -131,7 +159,9 @@ class StarPOTrainer:
                 "terminated": terminated,
                 "truncated": truncated,
                 "info": info,
+                "turn_idx": turn_idx,
             })
+            turn_idx += 1
 
             obs = next_obs
             messages.append({"role": "assistant", "content": response})
@@ -147,7 +177,8 @@ class StarPOTrainer:
         """对每个 prompt 采 num_rollouts 条轨迹放入 buffer。"""
         for state_info in prompt_states:
             seed = state_info.get("seed") if isinstance(state_info, dict) else None
-            for _ in range(self.num_rollouts):
+            from tqdm import tqdm
+            for _ in tqdm(range(self.num_rollouts), desc="Collecting rollouts"):
                 traj = self._rollout_one_trajectory(seed)
                 if len(traj) > 0:
                     self.buffer.add_trajectory(traj)

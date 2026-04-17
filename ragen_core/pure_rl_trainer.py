@@ -38,6 +38,8 @@ class PureRLTrainer:
         rcfg = config.ragen_config
         self.num_rollouts = rcfg.num_rollouts
         self.prompt_batch_size = rcfg.prompt_batch_size
+        # 与 StarPOTrainer 对齐：turn 级预算（RAGEN `agent_proxy.max_turn`）。
+        self.max_turn = rcfg.max_turn
 
         self.total_training_steps = config.total_training_steps
         self.eval_interval = config.eval_interval
@@ -51,7 +53,8 @@ class PureRLTrainer:
 
         logger.info(
             f"Initialized PureRLTrainer (no format reward / no variance filter) | "
-            f"total_training_steps={self.total_training_steps} num_rollouts={self.num_rollouts}"
+            f"total_training_steps={self.total_training_steps} num_rollouts={self.num_rollouts} "
+            f"max_turn={self.max_turn}"
         )
 
     # ----------------------------------------------------------------
@@ -61,14 +64,35 @@ class PureRLTrainer:
     def _rollout_one_trajectory(self, seed: Optional[int]) -> List[Dict[str, Any]]:
         obs, info = self.env.reset(seed=seed)
         system_prompt = self.agent.config.system_prompt
+
+        # 与 StarPOTrainer 保持一致：第一轮 user message 注入环境玩法说明。
+        env_instruction = self.env.get_env_instruction()
+        first_user = ""
+        if env_instruction:
+            first_user = env_instruction.rstrip() + "\n\n"
+        first_user += f"{obs}\n{self.env.get_valid_actions()}\nPlease reason step by step."
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{obs}\n{self.env.get_valid_actions()}\nPlease reason step by step."},
+            {"role": "user", "content": first_user},
         ]
 
         trajectory: List[Dict[str, Any]] = []
         terminated, truncated = False, False
+        turn_idx = 0
+
         while not (terminated or truncated):
+            # 与 StarPOTrainer 对齐的 turn-level 硬截断
+            if self.max_turn > 0 and turn_idx >= self.max_turn:
+                if trajectory:
+                    trajectory[-1]["truncated"] = True
+                    last_info = trajectory[-1].get("info") or {}
+                    last_info["truncated_reason"] = "max_turn_reached"
+                    last_info["max_turn"] = self.max_turn
+                    trajectory[-1]["info"] = last_info
+                truncated = True
+                break
+
             response = self.agent.chat_request(messages)
             next_obs, reward, terminated, truncated, info = self.env.step(response)
 
@@ -81,7 +105,9 @@ class PureRLTrainer:
                 "terminated": terminated,
                 "truncated": truncated,
                 "info": info,
+                "turn_idx": turn_idx,
             })
+            turn_idx += 1
 
             obs = next_obs
             messages.append({"role": "assistant", "content": response})

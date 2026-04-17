@@ -24,6 +24,11 @@ import traceback
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 控制台 tee —— 必须先于 loguru / transformers 等会缓存 sys.stderr 的库 import。
+# 让本次运行的所有 stdout + stderr 同步写入 <PROJECT_ROOT>/stdout.txt。
+from utils.stdout_tee import setup_stdout_tee  # noqa: E402
+setup_stdout_tee("stdout.txt")
+
 from configs.config import (
     ExperimentConfig,
     EnvConfig,
@@ -59,8 +64,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--env", type=str, default="frozenlake",
                    choices=["math", "cartpole", "frozenlake", "sokoban", "bandit"],
                    help="Environment to train on")
-    p.add_argument("--max_env_steps", type=int, default=5,
-                   help="Max steps per episode (environment-level truncation)")
+    p.add_argument("--max_env_steps", type=int, default=10,
+                   help="Max atomic env steps per episode (environment-level truncation). "
+                        "Aligns with RAGEN's max_actions_per_traj=10. Note: this counts atomic "
+                        "env steps, not LLM turns — the model can emit '<answer>A || B || C</answer>' "
+                        "to consume multiple steps in one turn.")
 
     # ---- Agent ----
     p.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct",
@@ -98,8 +106,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--format_penalty", type=float, default=-0.1)
     p.add_argument("--variance_filter_ratio", type=float, default=0.25,
                    help="Keep top-k ratio by group variance (StarPO-S; only used when trainer=starpo)")
-    p.add_argument("--max_turn", type=int, default=5,
-                   help="Max number of multi-turn exchanges (single-turn envs ignore this)")
+    p.add_argument("--max_turn", type=int, default=2,
+                   help="Max LLM turns (chat_request calls) per trajectory. Aligns with RAGEN "
+                        "`agent_proxy.max_turn`. This is the *turn*-level budget, independent from "
+                        "--max_env_steps (the atomic env-step budget): whichever hits first "
+                        "truncates the episode. RAGEN main FrozenLake/Sokoban configs use 1 "
+                        "(one-shot full-plan), but small models struggle under such sparse reward; "
+                        "default=3 gives the agent a few retries while still capping rollout cost. "
+                        "Single-turn envs (Bandit/Math) terminate after step 1 and are unaffected. "
+                        "Must be >= 1.")
 
     # ---- RL 算法通用超参 ----
     p.add_argument("--learning_rate", type=float, default=1e-6)
@@ -149,6 +164,15 @@ def parse_args() -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> ExperimentConfig:
     """将 argparse 结果显式地注入到 dataclass——不依赖 dataclass 自身的默认值。"""
+    # --- 最小合法性检查（argparse 不原生支持区间验证） ---
+    if args.max_turn < 1:
+        raise ValueError(
+            f"--max_turn must be >= 1 (got {args.max_turn}); "
+            "a trajectory with 0 LLM calls would produce no data."
+        )
+    if args.max_env_steps < 1:
+        raise ValueError(f"--max_env_steps must be >= 1 (got {args.max_env_steps}).")
+
     env_cfg = EnvConfig(
         env_name=args.env,
         max_steps=args.max_env_steps,
