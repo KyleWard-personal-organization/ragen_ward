@@ -1,257 +1,354 @@
-import torch
-import torch.nn as nn
-from typing import Any, Dict, List, Union, Tuple
+"""
+PPO (Proximal Policy Optimization) 算法 / PPO Algorithm
+-----------------------------------
+工业级 PPO 的轨迹级实现，严格对齐 RAGEN/veRL 的训练逻辑：
+
+1. 把一整条多轮 trajectory 拼成**一条长序列**（prompt + assistant_1 + obs_1 + assistant_2 + obs_2 + ... + assistant_N），
+   而不是把每个 turn 当做独立样本。这是复现多轮 credit assignment 的前提。
+2. 用 `loss_mask` 精确标记出需要学习的 assistant token，在非 assistant 位置上 mask 掉 loss。
+3. token_level_rewards 只在每个 assistant turn 的末尾位置放入该 turn 的 reward。
+4. 支持 **bi-level GAE**（turn 级 + token 级），通过 `bi_level_gae` 开关切换单层/双层。
+5. GAE 计算全部向量化（`gae_utils.py` 内部用 torch.flip 倒序递推）。
+6. 完整的 Actor-Critic 架构（Critic 是共享 backbone 的 value head）+ KL 约束 + PPO-Clip。
+"""
+
+import os
 import copy
 import random
-from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+
 from .base_algo import BaseRLAlgo
+from .gae_utils import compute_bi_level_gae_advantage_return, compute_gae_advantage_return
+from .optimizer_utils import build_optimizer
+from .trajectory_utils import tokenize_trajectory, collate_fn, forward_logprobs_and_entropy
 from utils.logger import logger
+
 
 class PPO(BaseRLAlgo):
     """
-    工业级 PPO (Proximal Policy Optimization) 算法落地实现。
-    严格对齐 RAGEN/veRL 的训练逻辑，包含:
-    1. 真实大模型的前向 Log Probs 获取。
-    2. 完整的 Actor-Critic 架构与 GAE (Generalized Advantage Estimation)。
-    3. KL 散度约束 (Reference Model)。
-    4. 批处理更新 (Mini-batch) 与 PPO-Clip 截断。
+    PPO 算法实现。
+
+    关键接口：
+    - `train_step(batch_data: List[List[Dict]])`：接收一个 batch 的 trajectories，每条 trajectory
+       是一个 dict 列表 (每个 dict 代表一个 turn，含 messages/response/reward/terminated 字段)。
+    - `save(path)` / `load(path)`：保存/加载 Actor 和 Critic 权重。
     """
-    
+
     def __init__(self, config: Any, agent: Any):
         super().__init__(config, agent)
-        # 从 config 提取 PPO 专属超参数
-        self.lr = getattr(config, 'learning_rate', 1e-5)
-        self.gamma = getattr(config, 'gamma', 0.99)
-        self.lam = getattr(config, 'lam', 0.95)
-        self.clip_ratio = getattr(config, 'clip_ratio', 0.2)
-        self.ppo_epochs = getattr(config, 'ppo_epochs', 4)
-        self.mini_batch_size = getattr(config, 'mini_batch_size', 2)
-        self.vf_coef = getattr(config, 'vf_coef', 0.5)
-        self.ent_coef = getattr(config, 'ent_coef', 0.01)
-        self.kl_coef = getattr(config, 'kl_coef', 0.05)
-        
+
+        # ---------- 超参（直接属性访问，缺失立即 AttributeError；默认值仅来自 scripts/train.py） ----------
+        self.lr = config.learning_rate
+        self.gamma = config.gamma
+        self.lam = config.lam
+        self.bi_level_gae = config.bi_level_gae
+        self.high_level_gamma = config.high_level_gamma
+        self.clip_ratio = config.clip_ratio
+        self.ppo_epochs = config.ppo_epochs
+        self.mini_batch_size = config.mini_batch_size
+        self.vf_coef = config.vf_coef
+        self.ent_coef = config.ent_coef
+        self.kl_coef = config.kl_coef
+        self.target_kl = config.target_kl                  # Optional[float]; None 即不启用
+        self.max_seq_length = config.max_seq_length
+        self.use_ref = config.use_ref
+        self.optimizer_name = config.optimizer
+
+        if not self.use_ref and self.kl_coef != 0.0:
+            logger.warning(
+                f"PPO: use_ref=False but kl_coef={self.kl_coef} != 0; "
+                f"forcing kl_coef=0 because no reference distribution is available."
+            )
+            self.kl_coef = 0.0
+
+        # ---------- 依赖 Agent ----------
         self.device = agent.device
         self.tokenizer = agent.tokenizer
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-            
-        if hasattr(self.agent, 'model'):
-            self.actor = self.agent.model
-            
-            logger.info("PPO: Creating Reference Model (Frozen) for KL penalty...")
+
+        if not hasattr(self.agent, 'model'):
+            logger.warning("Agent has no local 'model' attribute. Training will fail. (Evaluate-only agent?)")
+            return
+
+        self.actor = self.agent.model
+
+        self.ref_model: Optional[nn.Module]
+        if self.use_ref:
+            logger.info("PPO: creating frozen reference model (for KL) via deepcopy...")
             self.ref_model = copy.deepcopy(self.actor)
             self.ref_model.eval()
             self.ref_model.requires_grad_(False)
-            
-            logger.info("PPO: Creating Value Head (Critic)...")
-            hidden_size = self.actor.config.hidden_size
-            self.critic = nn.Linear(hidden_size, 1, dtype=self.actor.dtype).to(self.device)
-            
-            # Optimizer: Update both Actor and Critic
-            self.optimizer = torch.optim.AdamW(
-                list(self.actor.parameters()) + list(self.critic.parameters()), 
-                lr=self.lr
-            )
-            logger.info(f"Initialized PPO algorithm with LR={self.lr}, Epochs={self.ppo_epochs}, MiniBatch={self.mini_batch_size}")
         else:
-            logger.warning("Agent does not have a local 'model' attribute. Cannot train locally.")
+            logger.info("PPO: use_ref=False, skipping ref_model (saves ~1GB VRAM, disables KL anchor).")
+            self.ref_model = None
+
+        logger.info("PPO: creating Critic value head (Linear on top of actor hidden_states)...")
+        hidden_size = self.actor.config.hidden_size
+        self.critic = nn.Linear(hidden_size, 1, dtype=self.actor.dtype).to(self.device)
+
+        self.optimizer = build_optimizer(
+            name=self.optimizer_name,
+            params=list(self.actor.parameters()) + list(self.critic.parameters()),
+            lr=self.lr,
+            actor=self.actor,
+        )
+        logger.info(
+            f"PPO initialized | optimizer={self.optimizer_name} lr={self.lr} epochs={self.ppo_epochs} "
+            f"mini_bs={self.mini_batch_size} use_ref={self.use_ref} kl_coef={self.kl_coef} "
+            f"bi_level_gae={self.bi_level_gae} high_level_gamma={self.high_level_gamma} "
+            f"gamma={self.gamma} lam={self.lam} clip={self.clip_ratio}"
+        )
+
+    # ----------------------------------------------------------------
+    # 1. 数据准备：把 trajectory 拼成长序列（复用 trajectory_utils 的实现）
+    # ----------------------------------------------------------------
+
+    def _prepare_data(self, batch_data: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """将 batch trajectories tokenize 成长序列字典列表。"""
+        data = []
+        for traj in batch_data:
+            if len(traj) == 0:
+                continue
+            item = tokenize_trajectory(self.tokenizer, traj, self.max_seq_length)
+            if item["loss_mask"].sum().item() == 0:
+                # 纯 prompt 没有任何 assistant token（意外情况），跳过
+                continue
+            data.append(item)
+        return data
+
+    # ----------------------------------------------------------------
+    # 2. 前向传播：获取 log_probs 与 values
+    # ----------------------------------------------------------------
+
+    def _forward_actor_with_critic(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """前向 actor 并由 critic head 从最后一层 hidden_states 计算 values。"""
+        log_probs, entropy, hidden = forward_logprobs_and_entropy(
+            self.actor, input_ids, attention_mask, return_hidden_states=True,
+        )
+        values = self.critic(hidden).squeeze(-1).float()  # (B, L)
+        return log_probs, entropy, values
+
+    def _forward_ref(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """前向参考模型，只取 log_probs。仅在 self.ref_model is not None 时调用。"""
+        assert self.ref_model is not None, "_forward_ref called while ref_model is None"
+        log_probs, _, _ = forward_logprobs_and_entropy(
+            self.ref_model, input_ids, attention_mask, return_hidden_states=False,
+        )
+        return log_probs
+
+    # ----------------------------------------------------------------
+    # 3. 主训练循环
+    # ----------------------------------------------------------------
 
     def get_action(self, state: Any, evaluate: bool = False) -> Any:
         return self.agent.chat_request(state)
 
-    def _prepare_data(self, batch_data: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        """将环境交互轨迹拉平并转为 Tokenizer 编码的张量"""
-        data = []
-        for traj in batch_data:
-            for step in traj:
-                prompt_text = self.tokenizer.apply_chat_template(step["messages"], tokenize=False, add_generation_prompt=True)
-                response_text = step["response"]
-                reward = step["reward"]
-                
-                prompt_ids = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).input_ids[0]
-                response_ids = self.tokenizer(response_text, return_tensors="pt", add_special_tokens=False).input_ids[0]
-                
-                input_ids = torch.cat([prompt_ids, response_ids], dim=0)
-                response_mask = torch.cat([torch.zeros_like(prompt_ids), torch.ones_like(response_ids)], dim=0)
-                
-                data.append({
-                    "prompt_text": prompt_text,
-                    "input_ids": input_ids,
-                    "response_mask": response_mask,
-                    "reward": float(reward)
-                })
-        return data
-
-    def _collate_fn(self, batch: List[Dict[str, Any]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        input_ids = [s['input_ids'] for s in batch]
-        response_mask = [s['response_mask'] for s in batch]
-        
-        pad_id = self.tokenizer.pad_token_id
-        padded_input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_id)
-        padded_response_mask = torch.nn.utils.rnn.pad_sequence(response_mask, batch_first=True, padding_value=0)
-        attention_mask = (padded_input_ids != pad_id).long()
-        
-        return padded_input_ids, attention_mask, padded_response_mask
-
-    def _get_log_probs_and_values(self, model, input_ids, attention_mask, response_mask, critic=None):
-        """核心前向计算: 获取每个token的对数概率和价值预测"""
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=critic is not None)
-        logits = outputs.logits # (B, L, V)
-        
-        # Shift logits and labels for next-token prediction
-        log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
-        labels = input_ids[:, 1:]
-        token_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-        
-        shifted_response_mask = response_mask[:, 1:]
-        
-        values = None
-        if critic is not None:
-            hidden_states = outputs.hidden_states[-1] # (B, L, H)
-            values = self.critic(hidden_states).squeeze(-1) # (B, L)
-            values = values[:, :-1]
-            
-        return token_log_probs, values, shifted_response_mask
-
-    def _compute_gae(self, rewards_seq, values_seq, response_mask):
-        """计算广义优势估计 (GAE)"""
-        B, L = rewards_seq.shape
-        advantages = torch.zeros_like(rewards_seq)
-        returns = torch.zeros_like(rewards_seq)
-        
-        for b in range(B):
-            lastgaelam = 0.0
-            valid_indices = response_mask[b].nonzero(as_tuple=True)[0]
-            if len(valid_indices) == 0:
-                continue
-            
-            for t in reversed(range(len(valid_indices))):
-                idx = valid_indices[t]
-                next_val = values_seq[b, valid_indices[t+1]] if t + 1 < len(valid_indices) else 0.0
-                delta = rewards_seq[b, idx] + self.gamma * next_val - values_seq[b, idx]
-                lastgaelam = delta + self.gamma * self.lam * lastgaelam
-                advantages[b, idx] = lastgaelam
-                returns[b, idx] = lastgaelam + values_seq[b, idx]
-                
-        return advantages, returns
-
     def train_step(self, batch_data: List[List[Dict[str, Any]]]) -> Dict[str, Union[float, str]]:
+        """
+        接收一个 batch 的 trajectories，做一次完整的 PPO 更新。
+
+        Pipeline:
+            A. Tokenize trajectories → 长序列张量
+            B. 预计算阶段：对每个样本前向得到 old_log_probs / ref_log_probs / values / advantages
+            C. 训练阶段：ppo_epochs 轮，对每个 mini-batch 做 PPO-Clip 更新
+            D. 返回指标
+        """
         if not hasattr(self.agent, 'model'):
             return {"error": "Cannot train without a local model."}
-            
-        data = self._prepare_data(batch_data)
-        if len(data) == 0:
-            return {}
-            
-        logger.info(f"Starting PPO Phase: Precomputing LogProbs and Advantages for {len(data)} items...")
-        
-        self.actor.eval()
-        self.ref_model.eval()
-        
-        # 1. 预计算阶段 (Precomputation)
-        for i in range(0, len(data), self.mini_batch_size):
-            batch = data[i:i+self.mini_batch_size]
-            input_ids, attention_mask, response_mask = self._collate_fn(batch)
-            input_ids, attention_mask = input_ids.to(self.device), attention_mask.to(self.device)
-            response_mask = response_mask.to(self.device)
-            
-            with torch.no_grad():
-                old_log_probs, values, shifted_response_mask = self._get_log_probs_and_values(self.actor, input_ids, attention_mask, response_mask, self.critic)
-                ref_log_probs, _, _ = self._get_log_probs_and_values(self.ref_model, input_ids, attention_mask, response_mask)
-            
-            for j, item in enumerate(batch):
-                seq_len = item["input_ids"].size(0) - 1
-                
-                # 设置单步回合奖励(仅在回答的最后一个Token上生效)
-                reward_seq = torch.zeros(seq_len)
-                resp_idx = shifted_response_mask[j, :seq_len].nonzero(as_tuple=True)[0]
-                if len(resp_idx) > 0:
-                    reward_seq[resp_idx[-1]] = item["reward"]
-                
-                val_seq = values[j, :seq_len].cpu()
-                adv_seq, ret_seq = self._compute_gae(reward_seq.unsqueeze(0), val_seq.unsqueeze(0), shifted_response_mask[j, :seq_len].cpu().unsqueeze(0))
-                
-                item["old_log_probs"] = old_log_probs[j, :seq_len].cpu()
-                item["ref_log_probs"] = ref_log_probs[j, :seq_len].cpu()
-                item["advantages"] = adv_seq.squeeze(0).cpu()
-                item["returns"] = ret_seq.squeeze(0).cpu()
 
-        # 2. 训练阶段 (Training)
-        self.actor.train()
-        total_actor_loss, total_critic_loss, total_entropy, total_kl = 0.0, 0.0, 0.0, 0.0
-        update_steps = 0
-        
-        logger.info(f"Starting PPO Phase: Optimizing Actor & Critic for {self.ppo_epochs} epochs...")
-        for epoch in range(self.ppo_epochs):
-            random.shuffle(data)
+        data = self._prepare_data(batch_data)
+        if not data:
+            return {"skipped": 1.0, "reason": "empty_batch"}
+
+        logger.info(f"[PPO] Phase A: tokenized {len(data)} trajectories into sequences")
+
+        # -------- B. 预计算：old_log_probs / ref_log_probs / values / advantages / returns --------
+        self.actor.eval()
+        if self.ref_model is not None:
+            self.ref_model.eval()
+        self.critic.eval()
+
+        with torch.no_grad():
             for i in range(0, len(data), self.mini_batch_size):
-                batch = data[i:i+self.mini_batch_size]
-                input_ids, attention_mask, response_mask = self._collate_fn(batch)
-                input_ids, attention_mask = input_ids.to(self.device), attention_mask.to(self.device)
-                response_mask = response_mask.to(self.device)
-                
-                old_log_probs_batch = torch.nn.utils.rnn.pad_sequence([b["old_log_probs"] for b in batch], batch_first=True, padding_value=0.0).to(self.device)
-                ref_log_probs_batch = torch.nn.utils.rnn.pad_sequence([b["ref_log_probs"] for b in batch], batch_first=True, padding_value=0.0).to(self.device)
-                adv_batch = torch.nn.utils.rnn.pad_sequence([b["advantages"] for b in batch], batch_first=True, padding_value=0.0).to(self.device)
-                ret_batch = torch.nn.utils.rnn.pad_sequence([b["returns"] for b in batch], batch_first=True, padding_value=0.0).to(self.device)
-                
-                new_log_probs, values, shifted_response_mask = self._get_log_probs_and_values(self.actor, input_ids, attention_mask, response_mask, self.critic)
-                loss_mask = shifted_response_mask.bool()
-                
-                # Advantage 归一化 (Batch level)
-                valid_advs = adv_batch[loss_mask]
-                if valid_advs.numel() > 1:
-                    adv_batch = (adv_batch - valid_advs.mean()) / (valid_advs.std() + 1e-8)
-                
-                # PPO-Clip
-                ratio = torch.exp(new_log_probs - old_log_probs_batch)
-                surr1 = ratio * adv_batch
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * adv_batch
-                actor_loss = -torch.min(surr1, surr2)
-                
-                # Critic Loss
-                critic_loss = nn.MSELoss(reduction='none')(values, ret_batch)
-                
-                # KL & Entropy
-                kl = torch.exp(ref_log_probs_batch - new_log_probs) - (ref_log_probs_batch - new_log_probs) - 1.0
-                entropy = -(torch.exp(new_log_probs) * new_log_probs)
-                
-                # Masked Mean
-                actor_loss_mean = (actor_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1e-8)
-                critic_loss_mean = (critic_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1e-8)
-                kl_loss_mean = (kl * loss_mask).sum() / loss_mask.sum().clamp(min=1e-8)
-                entropy_loss_mean = (entropy * loss_mask).sum() / loss_mask.sum().clamp(min=1e-8)
-                
-                # Total Loss
-                loss = actor_loss_mean + self.vf_coef * critic_loss_mean + self.kl_coef * kl_loss_mean - self.ent_coef * entropy_loss_mean
-                
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(list(self.actor.parameters()) + list(self.critic.parameters()), 1.0)
-                self.optimizer.step()
-                
-                total_actor_loss += actor_loss_mean.item()
-                total_critic_loss += critic_loss_mean.item()
-                total_kl += kl_loss_mean.item()
-                total_entropy += entropy_loss_mean.item()
-                update_steps += 1
-                
-        return {
-            "actor_loss": total_actor_loss / max(1, update_steps),
-            "critic_loss": total_critic_loss / max(1, update_steps),
-            "kl_penalty": total_kl / max(1, update_steps),
-            "entropy": total_entropy / max(1, update_steps)
+                batch = data[i:i + self.mini_batch_size]
+                collated = collate_fn(self.tokenizer, batch)
+                input_ids = collated["input_ids"].to(self.device)
+                attn = collated["attention_mask"].to(self.device)
+                loss_mask = collated["loss_mask"].to(self.device)
+                token_rewards = collated["token_level_rewards"].to(self.device)
+
+                old_log_probs, _, values = self._forward_actor_with_critic(input_ids, attn)
+                # use_ref=False 时 ref_log_probs := old_log_probs，k3 估计自动算为 0
+                if self.ref_model is not None:
+                    ref_log_probs = self._forward_ref(input_ids, attn)
+                else:
+                    ref_log_probs = old_log_probs
+
+                # 计算 GAE（优先 bi-level，否则 flat）
+                if self.bi_level_gae:
+                    advantages, returns = compute_bi_level_gae_advantage_return(
+                        token_level_rewards=token_rewards,
+                        values=values,
+                        loss_mask=loss_mask,
+                        gamma=self.gamma,
+                        lam=self.lam,
+                        high_level_gamma=self.high_level_gamma,
+                    )
+                else:
+                    advantages, returns = compute_gae_advantage_return(
+                        token_level_rewards=token_rewards,
+                        values=values,
+                        response_mask=loss_mask,
+                        gamma=self.gamma,
+                        lam=self.lam,
+                    )
+
+                # 写回到单条样本 (去 padding)
+                for j, item in enumerate(batch):
+                    L_j = item["input_ids"].size(0)
+                    item["old_log_probs"] = old_log_probs[j, :L_j].cpu()
+                    item["ref_log_probs"] = ref_log_probs[j, :L_j].cpu()
+                    item["values"]        = values[j, :L_j].cpu()
+                    item["advantages"]    = advantages[j, :L_j].cpu()
+                    item["returns"]       = returns[j, :L_j].cpu()
+
+        # -------- C. 训练：ppo_epochs 次遍历，mini-batch 更新 --------
+        self.actor.train()
+        self.critic.train()
+
+        stats = {
+            "actor_loss": 0.0, "critic_loss": 0.0, "entropy": 0.0, "kl_penalty": 0.0,
+            "approx_kl": 0.0, "clip_frac": 0.0, "n_updates": 0,
         }
 
+        logger.info(f"[PPO] Phase C: optimizing for {self.ppo_epochs} epochs, mini_batch={self.mini_batch_size}")
+        early_stop = False
+        for epoch in range(self.ppo_epochs):
+            if early_stop:
+                break
+            random.shuffle(data)
+            for i in range(0, len(data), self.mini_batch_size):
+                batch = data[i:i + self.mini_batch_size]
+
+                # 重新 collate 这个 mini-batch（因为 padding 长度需要按当前 batch 定）
+                collated = collate_fn(self.tokenizer, batch)
+                input_ids = collated["input_ids"].to(self.device)
+                attn = collated["attention_mask"].to(self.device)
+                loss_mask = collated["loss_mask"].to(self.device)
+
+                # 预计算值 padding 到同一长度
+                old_log_probs = torch.nn.utils.rnn.pad_sequence(
+                    [b["old_log_probs"] for b in batch], batch_first=True, padding_value=0.0
+                ).to(self.device)
+                ref_log_probs = torch.nn.utils.rnn.pad_sequence(
+                    [b["ref_log_probs"] for b in batch], batch_first=True, padding_value=0.0
+                ).to(self.device)
+                advantages = torch.nn.utils.rnn.pad_sequence(
+                    [b["advantages"] for b in batch], batch_first=True, padding_value=0.0
+                ).to(self.device)
+                returns = torch.nn.utils.rnn.pad_sequence(
+                    [b["returns"] for b in batch], batch_first=True, padding_value=0.0
+                ).to(self.device)
+
+                # 本次前向（actor 要有梯度；critic 共享 actor backbone 的 hidden_states）
+                new_log_probs, entropy_per_pos, new_values = self._forward_actor_with_critic(input_ids, attn)
+
+                mask = loss_mask.float()
+                mask_sum = mask.sum().clamp(min=1e-8)
+
+                # ---- PPO-Clip actor loss ----
+                ratio = torch.exp(new_log_probs - old_log_probs)
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
+                actor_loss = -torch.min(surr1, surr2)
+                actor_loss = (actor_loss * mask).sum() / mask_sum
+
+                # ---- Critic MSE loss ----
+                # (注：也可以做 value clipping，这里先用朴素 MSE 保持简单)
+                critic_loss = (new_values - returns) ** 2
+                critic_loss = (critic_loss * mask).sum() / mask_sum
+
+                # ---- KL (k3 estimator，来自 Schulman's blog，稳定性更好) ----
+                kl_per_pos = torch.exp(ref_log_probs - new_log_probs) - (ref_log_probs - new_log_probs) - 1.0
+                kl_loss = (kl_per_pos * mask).sum() / mask_sum
+
+                # ---- Entropy bonus ----
+                entropy_loss = (entropy_per_pos * mask).sum() / mask_sum
+
+                loss = (
+                    actor_loss
+                    + self.vf_coef * critic_loss
+                    + self.kl_coef * kl_loss
+                    - self.ent_coef * entropy_loss
+                )
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.actor.parameters()) + list(self.critic.parameters()), 1.0
+                )
+                self.optimizer.step()
+
+                # ---- 统计（off-graph） ----
+                with torch.no_grad():
+                    # approx_kl 按 Schulman 近似：E[(ratio-1)-log(ratio)]
+                    approx_kl = ((ratio - 1.0) - (new_log_probs - old_log_probs)) * mask
+                    approx_kl = approx_kl.sum() / mask_sum
+                    clip_frac = (((ratio - 1.0).abs() > self.clip_ratio).float() * mask).sum() / mask_sum
+
+                stats["actor_loss"]  += actor_loss.item()
+                stats["critic_loss"] += critic_loss.item()
+                stats["entropy"]     += entropy_loss.item()
+                stats["kl_penalty"]  += kl_loss.item()
+                stats["approx_kl"]   += approx_kl.item()
+                stats["clip_frac"]   += clip_frac.item()
+                stats["n_updates"]   += 1
+
+                # 可选：target_kl 早停
+                if self.target_kl is not None and approx_kl.item() > 1.5 * self.target_kl:
+                    logger.warning(
+                        f"[PPO] target_kl exceeded ({approx_kl.item():.4f} > 1.5 * {self.target_kl}), early stop"
+                    )
+                    early_stop = True
+                    break
+
+        # 求平均
+        n = max(1, stats["n_updates"])
+        for k in ["actor_loss", "critic_loss", "entropy", "kl_penalty", "approx_kl", "clip_frac"]:
+            stats[k] = stats[k] / n
+
+        return stats
+
+    # ----------------------------------------------------------------
+    # 4. 保存 / 加载
+    # ----------------------------------------------------------------
+
     def save(self, path: str) -> None:
-        if hasattr(self.agent, 'model') and hasattr(self.agent, 'tokenizer'):
-            import os
-            os.makedirs(path, exist_ok=True)
-            self.agent.model.save_pretrained(path)
-            self.agent.tokenizer.save_pretrained(path)
-            # 保存 Critic
-            torch.save(self.critic.state_dict(), os.path.join(path, "critic.pt"))
-            logger.info(f"PPO actor, critic, and tokenizer saved to {path}")
+        if not hasattr(self.agent, 'model') or not hasattr(self.agent, 'tokenizer'):
+            return
+        os.makedirs(path, exist_ok=True)
+        self.agent.model.save_pretrained(path)
+        self.agent.tokenizer.save_pretrained(path)
+        torch.save(self.critic.state_dict(), os.path.join(path, "critic.pt"))
+        logger.info(f"[PPO] Saved actor+tokenizer+critic to {path}")
 
     def load(self, path: str) -> None:
-        logger.info(f"PPO model load logic is handled by HFAgent directly from {path}")
+        # Actor/Tokenizer 由 HFAgent 负责；此处仅加载 critic（如果存在）
+        critic_path = os.path.join(path, "critic.pt")
+        if os.path.exists(critic_path):
+            self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
+            logger.info(f"[PPO] Loaded critic from {critic_path}")
+        else:
+            logger.info(f"[PPO] No critic.pt under {path}, skip critic loading.")

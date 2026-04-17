@@ -13,7 +13,8 @@ class HFAgent(BaseAgent):
     """
     def __init__(self, config: Any):
         super().__init__(config)
-        self.model_name_or_path = getattr(config, 'model_name_or_path', 'Qwen/Qwen2.5-0.5B-Instruct')
+        # AgentConfig 必填字段；缺失直接 AttributeError，不再静默兜底。
+        self.model_name_or_path = config.model_name_or_path
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         self.tokenizer, self.model = self._load_model_and_tokenizer()
@@ -92,8 +93,8 @@ class HFAgent(BaseAgent):
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **model_inputs,
-                max_new_tokens=getattr(self.config, 'max_new_tokens', 512),
-                temperature=getattr(self.config, 'temperature', 0.7),
+                max_new_tokens=self.config.max_new_tokens,
+                temperature=self.config.temperature,
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id
             )

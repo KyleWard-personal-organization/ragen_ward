@@ -8,7 +8,7 @@ from configs.config import EnvConfig
 
 def test_math_env():
     print("=== Testing MathEnv (Countdown Game) ===")
-    config = EnvConfig(env_name="math")
+    config = EnvConfig(env_name="math", max_steps=5)
     env = make_env(config)
     
     # 第一次测试：测试非法输入
@@ -35,7 +35,7 @@ def test_math_env():
 
 def test_frozenlake_env():
     print("=== Testing FrozenLakeEnv ===")
-    config = EnvConfig(env_name="frozenlake")
+    config = EnvConfig(env_name="frozenlake", max_steps=20)
     env = make_env(config)
     
     obs, info = env.reset(seed=42)
@@ -49,7 +49,7 @@ def test_frozenlake_env():
 
 def test_bandit_env():
     print("=== Testing BanditEnv ===")
-    config = EnvConfig(env_name="bandit")
+    config = EnvConfig(env_name="bandit", max_steps=1)
     env = make_env(config)
     
     obs, info = env.reset(seed=123)
@@ -78,7 +78,7 @@ def test_sokoban_env():
         print("gym-sokoban is not installed. Skipping. Run `pip install gym-sokoban`")
         return
         
-    config = EnvConfig(env_name="sokoban")
+    config = EnvConfig(env_name="sokoban", max_steps=100)
     env = make_env(config)
     
     obs, info = env.reset(seed=10)
@@ -86,14 +86,14 @@ def test_sokoban_env():
     print(f"Valid actions: {env.get_valid_actions()}")
     
     print("\n--- Test: Push Left ---")
-    obs, reward, terminated, truncated, info = env.step("<answer> Right </answer>")
+    obs, reward, terminated, truncated, info = env.step("<answer> Left </answer>")
     print(f"obs:\n{obs}")
     print(f"reward: {reward}, terminated: {terminated}, info: {info}")
 
 def main():
     parser = argparse.ArgumentParser(description="Test environment wrappers.")
     parser.add_argument("--env", type=str, choices=["math", "frozenlake", "bandit", "sokoban", "all"], 
-                        default="sokoban", help="Which environment to test")
+                        default="all", help="Which environment to test")
     args = parser.parse_args()
     
     if args.env == "math" or args.env == "all":

@@ -8,10 +8,13 @@ from configs.config import AgentConfig
 def main():
     print("=== Testing HF Agent (with a small model for speed) ===")
     # 这里用一个极小的模型跑测试，防止下载 Qwen 很久
+    # AgentConfig 所有必填字段都要显式传入（默认值不再从 dataclass 取）
     config = AgentConfig(
         agent_type="hf",
-        model_name_or_path="gpt2", # 仅用于快速连通性测试
-        max_new_tokens=20
+        model_name_or_path="Qwen/Qwen2.5-0.5B-Instruct",
+        temperature=0.7,
+        max_new_tokens=64,
+        system_prompt="You are a helpful assistant.",
     )
     
     try:

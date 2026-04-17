@@ -18,10 +18,11 @@ class OpenAIAgent(BaseAgent):
             logger.error("OpenAI library is not installed. Please install it via `pip install openai`.")
             raise ImportError("OpenAI library is not installed.")
             
-        self.api_key = getattr(config, 'api_key', None)
-        self.base_url = getattr(config, 'base_url', None)
-        self.model_name = getattr(config, 'model_name_or_path', 'gpt-3.5-turbo')
-        
+        # AgentConfig 里：model_name_or_path 必填；api_key / base_url 为 Optional[str]（None 表示未设置）。
+        self.api_key = self.config.api_key
+        self.base_url = self.config.base_url
+        self.model_name = self.config.model_name_or_path
+
         self.client = openai.OpenAI(
             api_key=self.api_key,
             base_url=self.base_url
@@ -36,8 +37,8 @@ class OpenAIAgent(BaseAgent):
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
-                temperature=getattr(self.config, 'temperature', 0.7),
-                max_tokens=getattr(self.config, 'max_new_tokens', 512),
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_new_tokens,
             )
             return response.choices[0].message.content
         except Exception as e:

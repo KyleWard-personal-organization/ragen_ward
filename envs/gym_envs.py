@@ -10,8 +10,9 @@ class GymEnvWrapper(BaseEnv):
     """
     def __init__(self, config: Any):
         super().__init__(config)
-        self.env_name = getattr(config, 'env_name', 'CartPole-v1')
-        env_kwargs = getattr(config, 'kwargs', {})
+        # env_name 为 EnvConfig 必填字段；kwargs 是预留扩展字段（dataclass 中默认为空 dict）。
+        self.env_name = config.env_name
+        env_kwargs = config.kwargs
         self.env = gym.make(self.env_name, **env_kwargs)
         
     def reset(self, seed: Optional[int] = None, **kwargs) -> Tuple[str, dict]:
@@ -118,7 +119,8 @@ class SokobanEnv(GymEnvWrapper):
         # ----------------------------------------------------
         self.dim_room = (6, 6)     # (dim_x, dim_y)
         self.num_boxes = 1         # 箱子数量
-        self.max_steps = 100       # 最大步数
+        # 尊重 EnvConfig.max_steps；BaseEnv.__init__ 已经设好，这里保持不覆盖
+        # （如果用户传入 max_steps，就使用用户值；否则沿用 BaseEnv 默认 100）
         
         from gym_sokoban.envs.sokoban_env import SokobanEnv as CoreSokobanEnv
         
@@ -190,24 +192,28 @@ class SokobanEnv(GymEnvWrapper):
         )
 
     def _parse_action(self, action: str) -> Optional[int]:
+        """
+        解析 Sokoban 动作 (在 gym_sokoban 中 1: Push Up, 2: Push Down, 3: Push Left, 4: Push Right)。
+        同样先按数字解析，再按方向词 + word boundary 匹配。
+        """
         # 调用父类提取 <answer> 内容
         content = super()._parse_action(action)
         if isinstance(content, int) and 1 <= content <= 4:
-            # 在 gym_sokoban 中，1: Push Up, 2: Push Down, 3: Push Left, 4: Push Right
             return content
-            
+
         import re
         match = re.search(r'<answer>(.*?)</answer>', action, re.DOTALL)
         act_str = match.group(1).strip().lower() if match else action.strip().lower()
-        
-        action_map = {
-            "up": 1,
-            "down": 2,
-            "left": 3,
-            "right": 4
-        }
-        for k, v in action_map.items():
-            if k in act_str:
+
+        if act_str.isdigit():
+            num = int(act_str)
+            if 1 <= num <= 4:
+                return num
+            return None
+
+        word_map = {"up": 1, "down": 2, "left": 3, "right": 4}
+        for k, v in word_map.items():
+            if re.search(rf'\b{k}\b', act_str):
                 return v
         return None
 
@@ -215,7 +221,8 @@ class SokobanEnv(GymEnvWrapper):
 class FrozenLakeEnv(GymEnvWrapper):
     """FrozenLake特定环境封装，对齐 RAGEN 网格化文本渲染"""
     def __init__(self, config: Any):
-        # 原 RAGEN 中的配置，这里作为默认 kwargs 传给 GymEnvWrapper
+        # is_slippery / map_name 属于 FrozenLake **环境内部超参**，不是 EnvConfig 的必填字段。
+        # 在 EnvConfig 未显式挂载时使用 RAGEN 的默认取值（is_slippery=True, map_name="4x4"）。
         is_slippery = getattr(config, 'is_slippery', True)
         config.env_name = 'FrozenLake-v1'
         config.kwargs = {"is_slippery": is_slippery, "map_name": "4x4"}
@@ -252,22 +259,31 @@ class FrozenLakeEnv(GymEnvWrapper):
         return "Valid actions are: 1 (Left), 2 (Down), 3 (Right), 4 (Up). Output action in <answer> tag."
         
     def _parse_action(self, action: str) -> Optional[int]:
+        """
+        解析 FrozenLake 动作：
+        1. 先尝试提取 <answer> 标签中的内容
+        2. 如果内容能转为合法数字 (1-4)，按数字分支返回
+        3. 否则把内容转小写，严格匹配 left/down/right/up（使用 word boundary 避免 "step 12" 误匹配 "1" 的歧义）
+        """
         # 调用父类先抽离出 <answer> 中的内容
         content = super()._parse_action(action)
         if isinstance(content, int) and 1 <= content <= 4:
-            return content - 1 # Gym 内部是 0,1,2,3
-            
+            return content - 1  # Gym 内部是 0,1,2,3
+
         import re
         match = re.search(r'<answer>(.*?)</answer>', action, re.DOTALL)
         act_str = match.group(1).strip().lower() if match else action.strip().lower()
-        
-        action_map = {
-            "left": 0, "1": 0,
-            "down": 1, "2": 1,
-            "right": 2, "3": 2,
-            "up": 3, "4": 3
-        }
-        for k, v in action_map.items():
-            if k in act_str:
+
+        # 优先按纯数字匹配：若 act_str 本身就是 "1"/"2"/"3"/"4"，直接返回
+        if act_str.isdigit():
+            num = int(act_str)
+            if 1 <= num <= 4:
+                return num - 1
+            return None
+
+        # 再按方向词匹配，使用 \b 防止 "left" 误匹配 "leftover"、或 "2" 误匹配 "12"
+        word_map = {"left": 0, "down": 1, "right": 2, "up": 3}
+        for k, v in word_map.items():
+            if re.search(rf'\b{k}\b', act_str):
                 return v
         return None

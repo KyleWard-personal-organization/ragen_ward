@@ -11,7 +11,8 @@ class BaseEnv(ABC):
     def __init__(self, config: Any):
         self.config = config
         self.current_step = 0
-        self.max_steps = getattr(config, 'max_steps', 100)
+        # 必填字段；缺失直接 AttributeError，不再静默兜底。
+        self.max_steps = config.max_steps
 
     @abstractmethod
     def reset(self, seed: Optional[int] = None, **kwargs) -> Tuple[str, dict]:

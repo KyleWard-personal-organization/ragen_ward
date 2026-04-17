@@ -1,0 +1,106 @@
+# ============================================================================
+# ragen_ward 项目依赖清单
+# ----------------------------------------------------------------------------
+# 约定：
+#   1. 版本号采用下限+上限的语义，避免未来大版本 breaking change。
+#   2. 下方按"核心 / 环境扩展 / Agent 扩展 / 实验追踪 / 分析作图"分层列出，
+#      你可以根据实际需要注释掉不用的部分，保持环境最小化。
+#   3. 带前缀 "#" 的行为可选依赖，默认关闭；需要时自行放开。
+#   4. PyTorch 的 GPU 版本强烈建议从 PyTorch 官网按 CUDA 版本手动安装，
+#      不要直接 `pip install torch`，否则可能装到 CPU-only 的 wheel。
+#      Windows + CUDA 12.1 示例：
+#        pip install torch --index-url https://download.pytorch.org/whl/cu121
+#      Windows + CUDA 11.8 示例：
+#        pip install torch --index-url https://download.pytorch.org/whl/cu118
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 一、核心依赖（必装）
+# ----------------------------------------------------------------------------
+
+# 深度学习主框架，PPO / GRPO 的 nn.Module / 优化器 / autograd 都靠它
+# 注意：此处仅声明最低版本，具体 CUDA wheel 请按上方说明从官方 index 装
+torch>=2.1.0
+
+# HuggingFace Transformers：AutoModelForCausalLM / AutoTokenizer / apply_chat_template
+# 4.40+ 对 Qwen2.5、Llama3 的 chat_template 支持稳定
+transformers>=4.40.0
+
+# HuggingFace Hub：HFAgent 里通过 snapshot_download 从 HF 拉模型权重
+huggingface_hub>=0.20.0
+
+# 通用 RL 环境接口，CartPoleEnv / FrozenLakeEnv 基于它；注意是 gymnasium 不是旧版 gym
+gymnasium>=0.29.0
+
+# 数值计算（evaluate/metrics.py、rollout_filter 等处都在用）
+# 限制 <2.0 是为了避免与部分仍未适配 numpy 2.x 的深度学习库冲突
+numpy>=1.24.0,<2.0.0
+
+# loguru 日志库，utils/logger.py 里全项目统一用它输出到控制台+文件
+loguru>=0.7.0
+
+# 读取 .env 文件（utils/basic_utils.py::setup_env 中用；如果你不打算用环境变量可去掉）
+python-dotenv>=1.0.0
+
+
+# ----------------------------------------------------------------------------
+# 二、环境扩展（可选，按需放开）
+# ----------------------------------------------------------------------------
+
+# Sokoban 环境（envs/gym_envs.py::SokobanEnv 里是 lazy import，只有用 sokoban 时才需要）
+# 注意 PyPI 上的包名是 "gym-sokoban"，但 import 时用 "gym_sokoban"
+# gym-sokoban>=0.1.0
+
+
+# ----------------------------------------------------------------------------
+# 三、训练显存优化（强烈推荐 8GB/12GB 消费卡安装）
+# ----------------------------------------------------------------------------
+
+# bitsandbytes：提供 AdamW8bit 优化器，把 fp32 一阶/二阶矩量化为 8-bit，
+# 对 0.5B 级别模型可节省约 2GB optimizer state 显存。
+# 本项目默认 --optimizer adamw8bit 直接依赖该包；想保守可显式 --optimizer adamw。
+# Windows + CUDA 12 + Python>=3.10 + torch>=2.3 有官方 prebuilt wheel，直接 pip 即可。
+bitsandbytes>=0.43.0
+
+
+# ----------------------------------------------------------------------------
+# 四、Agent 扩展（可选）
+# ----------------------------------------------------------------------------
+
+# OpenAI 风格 API 调用（仅用于 agents/openai_agent.py，纯评测场景，不参与训练）
+# 如果只做本地 HF 模型训练/评测，可不装
+# openai>=1.0.0
+
+
+# ----------------------------------------------------------------------------
+# 五、实验追踪（可选）
+# ----------------------------------------------------------------------------
+
+# Weights & Biases：utils/tracker.py 里 lazy import，只有 --use_wandb 时才需要
+# wandb>=0.15.0
+
+
+# ----------------------------------------------------------------------------
+# 六、结果分析 & 作图（可选，跑完训练做事后分析时才需要）
+# ----------------------------------------------------------------------------
+
+# 读取 TrainingTracker 产出的 metrics.jsonl 做透视分析
+# pandas>=2.0.0
+
+# 绘制 loss / reward / entropy 曲线
+# matplotlib>=3.7.0
+
+
+# ============================================================================
+# 安装建议（Windows + conda，环境名 CASSC）
+# ----------------------------------------------------------------------------
+# 1) 激活环境：
+#      conda activate CASSC
+# 2) 先按 CUDA 版本装 PyTorch（示例 CUDA 12.1）：
+#      pip install torch --index-url https://download.pytorch.org/whl/cu121
+# 3) 再装其它核心包：
+#      pip install -r requirements.txt
+# 4) 需要 sokoban / openai / wandb / pandas / matplotlib 时，手动放开对应注释后
+#      pip install -r requirements.txt
+#    即可增量安装。
+# ============================================================================

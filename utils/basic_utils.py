@@ -9,7 +9,7 @@ import configs.constants as cs
 
 def setup_env():
     """加载环境变量"""
-    dotenv_path = op.join(cs.ROOT_DIR, '.env')
+    dotenv_path = op.join(cs.PROJECT_ROOT, '.env')
     load_dotenv(dotenv_path=dotenv_path)
     logger.info("Environment variables loaded")
     return
