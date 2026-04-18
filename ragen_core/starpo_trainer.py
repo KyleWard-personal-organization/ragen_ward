@@ -16,12 +16,12 @@ RAGEN 论文核心框架：State-Thinking-Actions-Reward Policy Optimization。
 
 import os
 import random
-import re
 import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from .rollout_utils import check_format, judge_success, rollout_one_trajectory
 from .trajectory_buffer import TrajectoryBuffer
 from configs.constants import CKPT_DIR
 from utils.logger import logger
@@ -97,81 +97,24 @@ class StarPOTrainer:
     @staticmethod
     def _check_format(response: str) -> bool:
         """检查输出是否符合 `<think>...</think>...<answer>...</answer>` 格式。"""
-        pattern = r'<think>.*?</think>\s*<answer>.*?</answer>'
-        return bool(re.search(pattern, response, re.DOTALL))
+        # 保持原有公共入口，委托给 rollout_utils 里的 check_format 以保证全局口径一致。
+        return check_format(response)
 
     # ----------------------------------------------------------------
-    # 2. Rollout collection
+    # 2. Rollout collection（委托给 ragen_core.rollout_utils 统一实现）
     # ----------------------------------------------------------------
 
     def _rollout_one_trajectory(self, seed: Optional[int]) -> List[Dict[str, Any]]:
-        """对给定 seed 采样一条完整 trajectory。"""
-        obs, info = self.env.reset(seed=seed)
-        system_prompt = self.agent.config.system_prompt
-
-        # RAGEN 风格：第一轮 user message 里夹带环境玩法说明（含多动作序列示例）。
-        # 后续 turn 不再重复注入，避免 context 累积过快。
-        env_instruction = self.env.get_env_instruction()
-        first_user = ""
-        if env_instruction:
-            first_user = env_instruction.rstrip() + "\n\n"
-        first_user += f"{obs}\n{self.env.get_valid_actions()}\nPlease reason step by step."
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": first_user},
-        ]
-
-        trajectory: List[Dict[str, Any]] = []
-        terminated, truncated = False, False
-        turn_idx = 0  # 已完成的 LLM turn 数
-
-        while not (terminated or truncated):
-            # ---- Turn-level 硬截断（RAGEN `agent_proxy.max_turn` 对齐） ----
-            # 在进入下一次 chat_request 之前判定：如果已经用满 max_turn，
-            # 就把上一条 entry 标注为 truncated-by-agent-budget 并退出循环。
-            if 0 < self.max_turn <= turn_idx:
-                if trajectory:
-                    trajectory[-1]["truncated"] = True
-                    last_info = trajectory[-1].get("info") or {}
-                    last_info["truncated_reason"] = "max_turn_reached"
-                    last_info["max_turn"] = self.max_turn
-                    trajectory[-1]["info"] = last_info
-                truncated = True
-                break
-
-            response = self.agent.chat_request(messages)
-
-            step_penalty = 0.0
-            if self.use_format_reward and not self._check_format(response):
-                step_penalty = self.format_penalty
-
-            next_obs, reward, terminated, truncated, info = self.env.step(response)
-            total_reward = reward + step_penalty
-
-            trajectory.append({
-                "obs": obs,
-                "messages": list(messages),
-                "response": response,
-                "reward": total_reward,
-                "env_reward": reward,
-                "format_penalty": step_penalty,
-                "terminated": terminated,
-                "truncated": truncated,
-                "info": info,
-                "turn_idx": turn_idx,
-            })
-            turn_idx += 1
-
-            obs = next_obs
-            messages.append({"role": "assistant", "content": response})
-            if not (terminated or truncated):
-                messages.append({
-                    "role": "user",
-                    "content": f"Observation: {obs}\nReward for last step: {reward}\nNext action?",
-                })
-
-        return trajectory
+        """对给定 seed 采样一条完整 trajectory（调用公共 rollout 工具）。"""
+        return rollout_one_trajectory(
+            env=self.env,
+            agent=self.agent,
+            seed=seed,
+            system_prompt=self.agent.config.system_prompt,
+            max_turn=self.max_turn,
+            use_format_reward=self.use_format_reward,
+            format_penalty=self.format_penalty,
+        )
 
     def collect_rollouts(self, prompt_states: List[Dict[str, Any]]) -> None:
         """对每个 prompt 采 num_rollouts 条轨迹放入 buffer。"""
@@ -265,11 +208,13 @@ class StarPOTrainer:
         for ep in range(self.eval_episodes):
             seed = random.randint(0, 2**31 - 1)
             traj = self._rollout_one_trajectory(seed)
-            total_reward = sum(step["env_reward"] for step in traj)
-            # success: env 在 info 里提供 is_success；否则以 env_reward>0.5 作为近似
-            last_info = traj[-1]["info"] if traj else {}
-            success = last_info.get("is_success", total_reward > 0.5) if isinstance(last_info, dict) else (total_reward > 0.5)
-            em.add_episode(reward=total_reward, success=bool(success), length=len(traj))
+            if not traj:
+                continue
+            total_reward = float(sum(step["env_reward"] for step in traj))
+            # 严格 RAGEN 口径：terminated and not truncated；
+            # env 在 info 里显式提供 is_success/success 时以 info 为准（见 judge_success）。
+            success = judge_success(traj)
+            em.add_episode_from_trajectory(traj, success=success)
             eval_rewards.append(total_reward)
 
         summary = em.summary()

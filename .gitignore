@@ -101,4 +101,5 @@ agent-transcripts/
 doc.md
 models/
 checkpoints/
+results/
 stdout.txt

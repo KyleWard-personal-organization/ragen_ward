@@ -35,7 +35,7 @@ class EnvConfig:
     """环境配置类 / Environment Configuration。"""
     env_name: str                                      # FrozenLake-v1 / CartPole-v1 / math / bandit / sokoban 等
     max_steps: int                                     # 每个 episode 的最大步数
-    kwargs: Dict[str, Any] = field(default_factory=dict)  # 仅做环境内部动态扩展用（如 FrozenLake 的 is_slippery）
+    kwargs: Dict[str, Any] = field(default_factory=dict)  # 环境内部动态扩展字段（留给具体子类自己消化）
 
 
 @dataclass

@@ -26,8 +26,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 控制台 tee —— 必须先于 loguru / transformers 等会缓存 sys.stderr 的库 import。
 # 让本次运行的所有 stdout + stderr 同步写入 <PROJECT_ROOT>/stdout.txt。
+# mode="w": 每次启动清空文件，只保留"最近一次"运行（train/evaluate 共用此文件）。
 from utils.stdout_tee import setup_stdout_tee  # noqa: E402
-setup_stdout_tee("stdout.txt")
+setup_stdout_tee("stdout.txt", mode="w")
 
 from configs.config import (
     ExperimentConfig,
@@ -71,7 +72,7 @@ def parse_args() -> argparse.Namespace:
                         "to consume multiple steps in one turn.")
 
     # ---- Agent ----
-    p.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct",
+    p.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
                    help="HuggingFace model path or repo id (local path preferred to skip download)")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--max_new_tokens", type=int, default=256)
@@ -250,6 +251,7 @@ def main() -> int:
     config = build_config(args)
     env = make_env(config.env_config)
     agent = HFAgent(config.agent_config)
+    assert False
     algo = make_algo(config.rl_algo_config, agent)
 
     if args.trainer == "starpo":
@@ -267,7 +269,10 @@ def main() -> int:
         raise
 
     save_path = os.path.join(CKPT_DIR, f"{args.exp_name}_final")
-    os.makedirs(save_path, exist_ok=True)
+    if os.path.exists(save_path):
+        import shutil
+        shutil.rmtree(save_path)
+        logger.info(f"Detect existed model at {save_path}, and delete the previous folder.")
     try:
         algo.save(save_path)
         logger.info(f"Final model saved to {save_path}")

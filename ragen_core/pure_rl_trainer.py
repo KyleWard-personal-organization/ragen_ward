@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from .rollout_utils import judge_success, rollout_one_trajectory
 from .trajectory_buffer import TrajectoryBuffer
 from configs.constants import CKPT_DIR
 from utils.logger import logger
@@ -62,61 +63,16 @@ class PureRLTrainer:
     # ----------------------------------------------------------------
 
     def _rollout_one_trajectory(self, seed: Optional[int]) -> List[Dict[str, Any]]:
-        obs, info = self.env.reset(seed=seed)
-        system_prompt = self.agent.config.system_prompt
-
-        # 与 StarPOTrainer 保持一致：第一轮 user message 注入环境玩法说明。
-        env_instruction = self.env.get_env_instruction()
-        first_user = ""
-        if env_instruction:
-            first_user = env_instruction.rstrip() + "\n\n"
-        first_user += f"{obs}\n{self.env.get_valid_actions()}\nPlease reason step by step."
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": first_user},
-        ]
-
-        trajectory: List[Dict[str, Any]] = []
-        terminated, truncated = False, False
-        turn_idx = 0
-
-        while not (terminated or truncated):
-            # 与 StarPOTrainer 对齐的 turn-level 硬截断
-            if self.max_turn > 0 and turn_idx >= self.max_turn:
-                if trajectory:
-                    trajectory[-1]["truncated"] = True
-                    last_info = trajectory[-1].get("info") or {}
-                    last_info["truncated_reason"] = "max_turn_reached"
-                    last_info["max_turn"] = self.max_turn
-                    trajectory[-1]["info"] = last_info
-                truncated = True
-                break
-
-            response = self.agent.chat_request(messages)
-            next_obs, reward, terminated, truncated, info = self.env.step(response)
-
-            trajectory.append({
-                "obs": obs,
-                "messages": list(messages),
-                "response": response,
-                "reward": reward,  # 不加 format penalty
-                "env_reward": reward,
-                "terminated": terminated,
-                "truncated": truncated,
-                "info": info,
-                "turn_idx": turn_idx,
-            })
-            turn_idx += 1
-
-            obs = next_obs
-            messages.append({"role": "assistant", "content": response})
-            if not (terminated or truncated):
-                messages.append({
-                    "role": "user",
-                    "content": f"Observation: {obs}\nReward for last step: {reward}\nNext action?",
-                })
-        return trajectory
+        """对给定 seed 采样一条完整 trajectory（委托给公共 rollout 工具，禁用 format reward）。"""
+        return rollout_one_trajectory(
+            env=self.env,
+            agent=self.agent,
+            seed=seed,
+            system_prompt=self.agent.config.system_prompt,
+            max_turn=self.max_turn,
+            use_format_reward=False,  # PureRL baseline: 不加格式惩罚
+            format_penalty=0.0,
+        )
 
     def collect_rollouts(self, prompt_states: List[Dict[str, Any]]) -> None:
         for state_info in prompt_states:
@@ -171,10 +127,11 @@ class PureRLTrainer:
         for _ in range(self.eval_episodes):
             seed = random.randint(0, 2**31 - 1)
             traj = self._rollout_one_trajectory(seed)
-            total_reward = sum(step["env_reward"] for step in traj)
-            last_info = traj[-1]["info"] if traj else {}
-            success = last_info.get("is_success", total_reward > 0.5) if isinstance(last_info, dict) else (total_reward > 0.5)
-            em.add_episode(reward=total_reward, success=bool(success), length=len(traj))
+            if not traj:
+                continue
+            total_reward = float(sum(step["env_reward"] for step in traj))
+            success = judge_success(traj)
+            em.add_episode_from_trajectory(traj, success=success)
             eval_rewards.append(total_reward)
         summary = em.summary()
         summary["eval/reward_variance"] = compute_reward_variance(eval_rewards)

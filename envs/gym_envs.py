@@ -140,6 +140,23 @@ class CartPoleEnv(GymEnvWrapper):
         config.env_name = 'CartPole-v1'
         super().__init__(config)
 
+    def _step_atomic(self, gym_action: Optional[int]) -> Tuple[str, float, bool, bool, dict]:
+        # CartPole 的"成功"语义：活到 max_steps 被 truncated（杆一直没倒）。
+        # terminated=True 表示杆倒或出界 → 失败。
+        # 不能沿用基类默认的 "terminated and not truncated = 成功"，那套逻辑对离散目标
+        # 环境（FrozenLake/Sokoban）是对的，但对 CartPole 语义刚好相反。
+        obs, reward, terminated, truncated, info = super()._step_atomic(gym_action)
+        if gym_action is None:
+            return obs, reward, terminated, truncated, info
+
+        if bool(terminated):
+            info["is_success"] = False
+        elif bool(truncated):
+            info["is_success"] = True
+        else:
+            info["is_success"] = False
+        return obs, reward, terminated, truncated, info
+
     def _format_obs(self, obs: Any) -> str:
         cart_pos, cart_vel, pole_angle, pole_vel = obs
         return (
@@ -323,21 +340,39 @@ class FrozenLakeEnv(GymEnvWrapper):
     """
     FrozenLake 封装，对齐 RAGEN 网格化文本渲染 + `||` 多动作序列。
 
-    默认使用 RAGEN 主流设置：4x4 地图 + is_slippery=True（打滑）。
+    默认使用 4x4 地图的确定性版本（降低小模型训练难度）。
     """
 
     # gymnasium FrozenLake 的离散动作：0=Left, 1=Down, 2=Right, 3=Up
     _WORD_TO_GYM = {"left": 0, "down": 1, "right": 2, "up": 3}
 
     def __init__(self, config: Any):
-        # is_slippery / map_name 是 FrozenLake 内部超参，不强制进 EnvConfig。
-        is_slippery = getattr(config, 'is_slippery', False)
         config.env_name = 'FrozenLake-v1'
-        config.kwargs = {"is_slippery": is_slippery, "map_name": "4x4"}
+        config.kwargs = {"is_slippery": False, "map_name": "4x4"}
         super().__init__(config)
 
         self.MAP_LOOKUP = {b"S": 1, b"F": 1, b"H": 2, b"G": 3}
         self.GRID_LOOKUP = {0: "P", 1: "_", 2: "O", 3: "G", 4: "X", 5: "√"}
+
+    def _step_atomic(self, gym_action: Optional[int]) -> Tuple[str, float, bool, bool, dict]:
+        # FrozenLake 的"成功"语义：踩到 Goal（唯一能给出 reward=1.0 的终止情形）。
+        # 掉洞同样是 terminated=True 但 reward=0.0，绝不能算作功。
+        # 同时在这里顺便判 action_is_effective：gymnasium 的 FrozenLake obs 就是玩家
+        # 的格子索引（self.env.unwrapped.s）——step 前后位置不变即"撞墙/出界"，即
+        # 动作未生效。
+        prev_s = int(self.env.unwrapped.s) if gym_action is not None else None
+        obs, reward, terminated, truncated, info = super()._step_atomic(gym_action)
+        if gym_action is None:
+            return obs, reward, terminated, truncated, info
+
+        if bool(terminated):
+            info["is_success"] = bool(float(reward) >= 1.0 - 1e-6)
+        else:
+            info["is_success"] = False
+
+        curr_s = int(self.env.unwrapped.s)
+        info["action_is_effective"] = bool(curr_s != prev_s)
+        return obs, reward, terminated, truncated, info
 
     def _format_obs(self, obs: Any) -> str:
         import numpy as np
@@ -368,9 +403,8 @@ class FrozenLakeEnv(GymEnvWrapper):
     def get_env_instruction(self) -> str:
         return (
             "You are solving FrozenLake. Navigate from the player (P) to the goal (G) "
-            "while avoiding holes (O). The ice is slippery, so you may occasionally "
-            "slide in an unintended direction — plan a sequence of moves to leave "
-            "room for slips.\n"
+            "while avoiding holes (O). Each move shifts the player by exactly one tile "
+            "in the chosen direction; moving into a wall leaves the player in place.\n"
             "**Answer format**: put a sequence of moves inside <answer>...</answer>, "
             "separated by `||`. Words (Left/Down/Right/Up) or numbers (1-4) both work.\n"
             "Example: <think>The goal is to the lower right. I'll head right then down.</think>"
