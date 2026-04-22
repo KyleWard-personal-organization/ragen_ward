@@ -15,6 +15,23 @@ from .base_env import BaseEnv
 
 
 class BanditEnv(BaseEnv):
+
+    agent_system_prompt = (
+        "You are a symbolic-reasoning agent facing a two-armed bandit. Each episode you "
+        "see two arms with semantically meaningful English names (e.g. 'Safe&Steady' vs. "
+        "'HighRisk&HighReward') — these names are the **only** clue about their reward "
+        "distributions. Infer the payoff shape from language: words like 'Safe', "
+        "'Steady' suggest low-variance small reward; words like 'Risk', 'HighReward' "
+        "suggest a low-probability jackpot with high variance. This is a one-shot "
+        "decision: the episode ends immediately after your single pull.\n"
+        "Output format is strict and non-negotiable: first weigh the two names inside "
+        "<think>...</think>, then output EXACTLY one arm name (verbatim, including the "
+        "'&' and capitalization) inside <answer>...</answer>.\n"
+        "Example: <think>'HighRisk&HighReward' hints at an occasional jackpot that could "
+        "still outweigh the small steady payoff of 'Safe&Steady' in expectation.</think>"
+        "<answer>HighRisk&HighReward</answer>"
+    )
+
     def __init__(self, config: Any):
         super().__init__(config)
         self.name_b: Optional[str] = None

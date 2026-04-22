@@ -32,6 +32,23 @@ from typing import Any, Tuple, Dict, List, Optional
 
 class BaseEnv(ABC):
 
+    # ------------------------------------------------------------------
+    # Agent-facing system prompt（环境 → LLM 的"人设 + 格式契约"）
+    # ------------------------------------------------------------------
+    # System prompt 本质上是"任务/环境相关的 agent 角色设定 + 输出格式约束"，
+    # 所以 **应该由环境类持有**，而不是作为 agent/CLI 参数（换一个 env 就
+    # 必须同步改 CLI 会非常容易漂移）。
+    #
+    # - 这里提供的是**兜底默认值**：任何未重写该属性的子类都会继承它。
+    # - 子类建议通过 class attribute 形式覆盖即可：
+    #       class FooEnv(BaseEnv):
+    #           agent_system_prompt = "You are a Foo expert ..."
+    # - rollout 工具（ragen_core.rollout_utils.rollout_one_trajectory）会
+    #   直接从 `env.agent_system_prompt` 读取，拼到 messages[0] 的 system
+    #   message。get_env_instruction()（每条 traj 首个 user message）仍是
+    #   另一层正交的"环境玩法说明 + 多动作协议示例"。
+    agent_system_prompt: str = "You are a helpful reinforcement learning agent."
+
     def __init__(self, config: Any):
         self.config = config
         self.current_step = 0

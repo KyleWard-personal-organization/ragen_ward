@@ -173,7 +173,7 @@ python scripts/train.py `
 | Agent | `--model` | `Qwen/Qwen2.5-0.5B-Instruct` | 模型路径或 HF repo 名 |
 | Agent | `--temperature` | `1.0` | 采样温度（与 RAGEN 训练配置对齐） |
 | Agent | `--max_new_tokens` | `256` | 单次生成 token 上限 |
-| Agent | `--system_prompt` | `"You are a helpful reinforcement learning agent."` | 系统提示 |
+| Agent | _system prompt_ | 由 `envs/*::agent_system_prompt` 持有 | **不是 CLI 参数**。每个环境自带任务相关的"人设 + 格式契约"，`rollout_utils` 自动读 `env.agent_system_prompt`。想改 prompt 直接改对应 env 类即可 |
 | 训练 | `--trainer` | `starpo` | starpo / pure |
 | 训练 | `--algo` | `ppo` | ppo / grpo |
 | 训练 | `--total_training_steps` | `200` | **每步 = 一次 rollout + 一次更新** |
@@ -189,7 +189,8 @@ python scripts/train.py `
 | RAGEN | `--max_turn` | `3` | 每条 trajectory 最多调用 LLM 的次数（RAGEN `agent_proxy.max_turn`）。与 `--max_env_steps` **两层独立截断**，任一触发即 truncate。RAGEN 主力 FrozenLake/Sokoban 用 `1`（0.5B 小模型 + 1600 rollout 配置下过于严苛，默认 3 给模型几次试错空间）。单轮任务（Bandit/Math）第一个 atomic step 就 terminated，不受影响。 |
 | RL | `--learning_rate` | `1e-6` | AdamW 学习率 |
 | RL | `--ppo_epochs` | `1` | 每批数据更新轮数 |
-| RL | `--mini_batch_size` | `2` | 梯度更新样本数 |
+| RL | `--micro_batch_size` | `2` | 单次 forward/backward 的样本数（VRAM 峰值由此决定；对齐 RAGEN `ppo_micro_batch_size_per_gpu`） |
+| RL | `--gradient_accumulation` | `4` | 梯度累积步数；`1` 即关闭累积（等价于 micro-batch 立即 step）。逻辑 mini-batch = `micro_batch_size × gradient_accumulation`，对齐 RAGEN `ppo_mini_batch_size`。**Gradient Checkpointing 已硬编码启用，无开关参数**（rollout 阶段不受影响）|
 | RL | `--clip_ratio` | `0.2` | PPO-Clip 阈值 |
 | RL | `--kl_coef` | `0.001` | KL 系数；`0.001` 对齐 RAGEN 主流实验，`0.0` 对应 `ppo-nokl` ablation |
 | RL | `--ent_coef` | `0.001` | 熵正则化系数 |

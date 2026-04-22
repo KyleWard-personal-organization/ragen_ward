@@ -40,12 +40,22 @@ class EnvConfig:
 
 @dataclass
 class AgentConfig:
-    """Agent 配置类 / Agent Configuration。"""
+    """
+    Agent 配置类 / Agent Configuration。
+
+    .. note::
+        这里**故意不包含** ``system_prompt`` 字段。
+        System prompt 本质上是"环境任务的 agent 人设 + 输出格式契约"，属于环境侧
+        的责任（见 ``envs/base_env.py::BaseEnv.agent_system_prompt`` 和各子类的
+        覆盖）。Agent 本身是"通用 LLM 客户端"，不应与具体任务 prompt 耦合：否则
+        每换一个 env 都要同步改 AgentConfig，极易漂移。
+        ``rollout_utils.rollout_one_trajectory`` 会直接从 ``env.agent_system_prompt``
+        读取该字符串，填到 messages[0] 的 system message。
+    """
     agent_type: str                                    # "hf" 本地模型 / "openai" 远程 API
     model_name_or_path: str                            # HF 模型名或本地路径
     temperature: float                                 # 采样温度
     max_new_tokens: int                                # 单次生成的最大 token 数
-    system_prompt: str                                 # 系统提示词
     api_key: Optional[str] = None                      # 仅 openai agent 使用，缺省即未设置
     base_url: Optional[str] = None                     # 仅 openai agent 使用，缺省即未设置
     kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -74,7 +84,11 @@ class RLAlgoConfig:
     bi_level_gae: bool                                 # 是否开启 turn 级 + token 级 双层 GAE
     high_level_gamma: float                            # turn 级折扣因子 (仅 bi_level_gae=True 时有效)
     ppo_epochs: int                                    # 每批数据上的 PPO/GRPO 更新轮数
-    mini_batch_size: int                               # 每次反向传播使用的样本数
+    micro_batch_size: int                              # 每次 forward/backward 的样本数（VRAM 峰值由此决定）
+    gradient_accumulation: int                         # 梯度累积步数；1 即关闭累积（等同于 micro_batch 立即 step）。
+    #                                                  # 等效的 "mini_batch_size" = micro_batch_size * gradient_accumulation，
+    #                                                  # 乘法定义避免除不尽问题；对齐 RAGEN 论文的
+    #                                                  # ppo_mini_batch_size = micro_batch_size_per_gpu * grad_accum。
     clip_ratio: float                                  # PPO-Clip 截断范围
     vf_coef: float                                     # Critic loss 系数 (PPO 专属)
     ent_coef: float                                    # 熵正则化系数

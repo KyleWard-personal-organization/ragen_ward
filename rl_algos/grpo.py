@@ -42,7 +42,12 @@ class GRPO(BaseRLAlgo):
         # ---------- 超参（直接属性访问；默认值仅来自 scripts/train.py） ----------
         self.lr = config.learning_rate
         self.ppo_epochs = config.ppo_epochs
-        self.mini_batch_size = config.mini_batch_size
+        self.micro_batch_size = config.micro_batch_size
+        self.gradient_accumulation = max(1, int(config.gradient_accumulation))
+        # 等效的 "mini_batch_size"（乘法派生，仅用于日志 / 对外展示）：
+        # - gradient_accumulation == 1 时等价于"每个 micro_batch 立即 step"
+        # - gradient_accumulation > 1 时走梯度累积
+        self.mini_batch_size = self.micro_batch_size * self.gradient_accumulation
         self.clip_ratio = config.clip_ratio
         self.ent_coef = config.ent_coef
         self.kl_coef = config.kl_coef
@@ -69,12 +74,30 @@ class GRPO(BaseRLAlgo):
 
         self.actor = self.agent.model
 
+        # Gradient checkpointing: 强制启用。forward 时只保留 √L 层的激活，backward 时重算。
+        # 代价：forward 时间 +30% 左右；收益：激活显存 ~0.5×，让小 VRAM 机能跑更大 micro_batch / max_seq_length。
+        # ⚠️ HF 实现细节：`gradient_checkpointing_enable()` 会**全局**把 `config.use_cache = False`，
+        # 这个 config 不区分 train/eval。如果不显式打开，rollout 阶段 `model.generate()` 也会被
+        # 强制关闭 KV cache → autoregressive decode 退化为 O(L²) 而非 O(L)，慢 3-10×。
+        # 修复：checkpointing 启用后立刻把 use_cache 改回 True。训练阶段所有 forward 入口
+        # （`trajectory_utils.forward_logprobs_and_entropy`）都已经显式传 `use_cache=False`，
+        # 所以 config 这里设 True 不会影响训练正确性，只会让 rollout 的 generate 用上 cache。
+        if hasattr(self.actor, "gradient_checkpointing_enable"):
+            self.actor.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            if hasattr(self.actor, "enable_input_require_grads"):
+                self.actor.enable_input_require_grads()
+            self.actor.config.use_cache = True
+            logger.info("GRPO: gradient_checkpointing enabled on actor (non-reentrant); use_cache restored to True for rollout speed.")
+
         self.ref_model: Optional[nn.Module]
         if self.use_ref:
             logger.info("GRPO: creating frozen reference model (for KL) via deepcopy...")
             self.ref_model = copy.deepcopy(self.actor)
             self.ref_model.eval()
             self.ref_model.requires_grad_(False)
+            # ref_model 只做 forward + no_grad，checkpointing 对它没用，关掉以省重算时间
+            if hasattr(self.ref_model, "gradient_checkpointing_disable"):
+                self.ref_model.gradient_checkpointing_disable()
         else:
             logger.info("GRPO: use_ref=False, skipping ref_model (saves ~1GB VRAM, disables KL anchor).")
             self.ref_model = None
@@ -87,7 +110,9 @@ class GRPO(BaseRLAlgo):
         )
         logger.info(
             f"GRPO initialized | optimizer={self.optimizer_name} lr={self.lr} epochs={self.ppo_epochs} "
-            f"mini_bs={self.mini_batch_size} use_ref={self.use_ref} kl_coef={self.kl_coef} "
+            f"micro_bs={self.micro_batch_size} grad_accum={self.gradient_accumulation} "
+            f"(effective mini_bs={self.mini_batch_size}) "
+            f"use_ref={self.use_ref} kl_coef={self.kl_coef} "
             f"clip={self.clip_ratio} ent_coef={self.ent_coef}"
         )
 
@@ -159,8 +184,8 @@ class GRPO(BaseRLAlgo):
             self.ref_model.eval()
 
         with torch.no_grad():
-            for i in range(0, len(data), self.mini_batch_size):
-                batch = data[i:i + self.mini_batch_size]
+            for i in range(0, len(data), self.micro_batch_size):
+                batch = data[i:i + self.micro_batch_size]
                 collated = collate_fn(self.tokenizer, batch)
                 input_ids = collated["input_ids"].to(self.device)
                 attn = collated["attention_mask"].to(self.device)
@@ -187,14 +212,21 @@ class GRPO(BaseRLAlgo):
             "group_adv_std": float(torch.tensor([d["group_adv_scalar"] for d in data]).std(unbiased=False).item()),
         }
 
-        logger.info(f"[GRPO] Phase C: optimizing for {self.ppo_epochs} epochs, mini_batch={self.mini_batch_size}")
+        logger.info(
+            f"[GRPO] Phase C: optimizing for {self.ppo_epochs} epochs, "
+            f"micro_batch={self.micro_batch_size}, grad_accum={self.gradient_accumulation} "
+            f"(effective mini_batch={self.mini_batch_size})"
+        )
         early_stop = False
         for epoch in range(self.ppo_epochs):
             if early_stop:
                 break
             random.shuffle(data)
-            for i in range(0, len(data), self.mini_batch_size):
-                batch = data[i:i + self.mini_batch_size]
+            # 每个 epoch 起始清零梯度；循环内按 accum 节奏 step（末尾强制 flush，防止数据不整除时梯度被丢）
+            self.optimizer.zero_grad()
+            accum_counter = 0
+            for i in range(0, len(data), self.micro_batch_size):
+                batch = data[i:i + self.micro_batch_size]
 
                 collated = collate_fn(self.tokenizer, batch)
                 input_ids = collated["input_ids"].to(self.device)
@@ -232,10 +264,15 @@ class GRPO(BaseRLAlgo):
 
                 loss = actor_loss + self.kl_coef * kl_loss - self.ent_coef * entropy_loss
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-                self.optimizer.step()
+                # Gradient accumulation: 把 loss 缩放后 backward，梯度累加到 .grad；
+                # 累满 accum 步或到达 epoch 末尾时才 clip + step + zero_grad。
+                (loss / self.gradient_accumulation).backward()
+                accum_counter += 1
+                is_last_micro = (i + self.micro_batch_size >= len(data))
+                if (accum_counter % self.gradient_accumulation == 0) or is_last_micro:
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - (new_log_probs - old_log_probs)) * mask
@@ -259,6 +296,20 @@ class GRPO(BaseRLAlgo):
         n = max(1, stats["n_updates"])
         for k in ["actor_loss", "entropy", "kl_penalty", "approx_kl", "clip_frac"]:
             stats[k] = stats[k] / n
+
+        # ⚠️ 必须切回 eval 模式：train_step 结束后 trainer 会进入下一轮 rollout（model.generate）。
+        # 如果留在 train 模式，Qwen2 forward 内部 `if self.gradient_checkpointing and self.training:`
+        # 会判 True，强制把 use_cache 关掉 → autoregressive decode 退化为 O(L²)，rollout 慢 3-10×。
+        # 切回 eval 后 self.training=False → checkpointing 路径不激活 → KV cache 正常工作。
+        self.actor.eval()
+
+        # Phase C 刚结束是整条 pipeline 的 VRAM 峰值点（activation + gradient + AdamW 临时 buffer
+        # 都在 allocator pool 里）。在此调用 empty_cache 把闲置 bin 归还 CUDA driver，
+        # 小 VRAM 环境下能显著降低 Windows WDDM 把 tensor 搬到 "共享 GPU 内存" 的概率，
+        # 从而减少系统 RAM 被间接吃掉的那部分。单次开销 ~100-300 ms，相对数百秒的
+        # train_step 可忽略；对数值 bit-exact 无任何影响。
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return stats
 

@@ -14,6 +14,23 @@ from .base_env import BaseEnv
 
 
 class MathEnv(BaseEnv):
+
+    agent_system_prompt = (
+        "You are a mathematical reasoning agent solving the Countdown puzzle. You are "
+        "given a list of 4 integers and a target integer; build a single arithmetic "
+        "expression using **each given number exactly once** (no reuse, no extra "
+        "numbers) together with +, -, *, / and parentheses, such that the expression "
+        "evaluates to the target. Integer division is fine but avoid it unless the "
+        "division is exact. Always verify your candidate by computing it mentally "
+        "before committing. This is a one-shot task: the episode ends whether you are "
+        "right or wrong.\n"
+        "Output format is strict and non-negotiable: show the derivation inside "
+        "<think>...</think>, then output ONLY the final expression (no `=`, no "
+        "explanation, no leading 'Answer:') inside <answer>...</answer>.\n"
+        "Example: <think>Target 14 from [2,3,4,5]: try 2+3+4+5 = 14. That matches.</think>"
+        "<answer>2 + 3 + 4 + 5</answer>"
+    )
+
     def __init__(self, config: Any):
         super().__init__(config)
         self.numbers: List[int] = []

@@ -14,7 +14,6 @@ def main():
         model_name_or_path="Qwen/Qwen2.5-0.5B-Instruct",
         temperature=0.7,
         max_new_tokens=64,
-        system_prompt="You are a helpful assistant.",
     )
     
     try:

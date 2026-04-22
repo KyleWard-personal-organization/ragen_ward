@@ -18,6 +18,7 @@ import os
 import random
 import time
 from typing import Any, Dict, List, Optional
+import torch, gc
 
 import numpy as np
 
@@ -105,12 +106,12 @@ class StarPOTrainer:
     # ----------------------------------------------------------------
 
     def _rollout_one_trajectory(self, seed: Optional[int]) -> List[Dict[str, Any]]:
-        """对给定 seed 采样一条完整 trajectory（调用公共 rollout 工具）。"""
+        """对给定 seed 采样一条完整 trajectory（调用公共 rollout 工具）。
+        system prompt 由 env.agent_system_prompt 提供，rollout_utils 内部直接读。"""
         return rollout_one_trajectory(
             env=self.env,
             agent=self.agent,
             seed=seed,
-            system_prompt=self.agent.config.system_prompt,
             max_turn=self.max_turn,
             use_format_reward=self.use_format_reward,
             format_penalty=self.format_penalty,
@@ -191,6 +192,18 @@ class StarPOTrainer:
                 merged[f"train/{k}"] = v
             else:
                 merged[f"train/{k}"] = str(v)
+
+        # 每步末尾强制回收 Python & CUDA 内存池：
+        # - batch_data 是 buffer.trajectories 的引用，删掉只是释放局部引用（buffer 自身
+        #   会在下个 step 开头 clear），不影响 trajectories 生命周期，但至少让 GC 可见。
+        # - gc.collect() 强制回收循环引用 / 大对象。
+        # - torch.cuda.empty_cache() 把 CUDA caching allocator 里未使用的 bin 归还给
+        #   driver，避免 Windows WDDM 把溢出部分搬到"共享 GPU 内存"(扣系统 RAM)。
+        del batch_data
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return merged
 
     # ----------------------------------------------------------------

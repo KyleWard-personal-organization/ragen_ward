@@ -39,7 +39,6 @@ def rollout_one_trajectory(
     agent: Any,
     *,
     seed: Optional[int],
-    system_prompt: str,
     max_turn: int,
     use_format_reward: bool = False,
     format_penalty: float = 0.0,
@@ -47,11 +46,16 @@ def rollout_one_trajectory(
     """
     用给定 agent 在给定 env 里跑一条完整 trajectory。
 
+    .. note::
+        **System prompt 从 ``env.agent_system_prompt`` 读取**（见
+        ``envs/base_env.py::BaseEnv.agent_system_prompt`` 和各子类覆盖）。
+        换环境时不需要改 CLI 或调用方代码，prompt 随环境自动切换。
+
     Args:
-        env:                  继承 BaseEnv 的环境实例，调用方已经构造好
+        env:                  继承 BaseEnv 的环境实例，调用方已经构造好。
+                              必须带有 ``agent_system_prompt`` 属性（BaseEnv 默认有兜底值）。
         agent:                实现 `chat_request(messages) -> str` 的 agent
         seed:                 传给 env.reset 的 seed；None 表示让环境自选
-        system_prompt:        system message 内容
         max_turn:             turn 级硬截断（LLM chat_request 调用次数上限）。
                               与 env 自身的 max_steps 各自独立，任一触发 → truncate。
                               必须 >= 1。
@@ -86,8 +90,9 @@ def rollout_one_trajectory(
         first_user = env_instruction.rstrip() + "\n\n"
     first_user += f"{obs}\n{env.get_valid_actions()}\nPlease reason step by step."
 
+    # System prompt 强制由 env 提供（BaseEnv 已给兜底值，任何 env 都有）。
     messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": env.agent_system_prompt},
         {"role": "user", "content": first_user},
     ]
 

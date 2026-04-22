@@ -38,7 +38,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 让本次运行的所有 stdout + stderr 同步写入 <PROJECT_ROOT>/stdout.txt。
 # mode="w": 每次启动清空文件，只保留"最近一次"运行（与 scripts/train.py 共用此文件）。
 from utils.stdout_tee import setup_stdout_tee  # noqa: E402
-setup_stdout_tee("stdout.txt", mode="w")
+setup_stdout_tee("eval_stdout.txt", mode="w")
 
 from configs.config import EnvConfig, AgentConfig
 from configs.constants import CKPT_DIR
@@ -54,8 +54,8 @@ from utils.tracker import TrainingTracker
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate RAGEN-Ward framework")
     # 运行总控
-    p.add_argument("--exp_name", type=str, default="eval_default")
-    p.add_argument("--episodes", type=int, default=10,
+    p.add_argument("--exp_name", type=str, default="eval_trained_30step ")
+    p.add_argument("--episodes", type=int, default=50,
                    help="Number of episodes to evaluate (RAGEN paper uses 256-512; "
                         "50 is a practical balance for single-GPU HF models)")
     p.add_argument("--seed", type=int, default=42,
@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     # 环境
     p.add_argument("--env", type=str, default="frozenlake",
                    choices=["math", "cartpole", "frozenlake", "sokoban", "bandit"])
-    p.add_argument("--max_env_steps", type=int, default=20,
+    p.add_argument("--max_env_steps", type=int, default=10,
                    help="Max atomic env steps per episode (environment-level truncation)")
     p.add_argument("--max_turn", type=int, default=5,
                    help="Max LLM turns (chat_request calls) per trajectory. Aligns with "
@@ -80,14 +80,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model_source", type=str, default="base", choices=["base", "trained"],
                    help="base = HF repo id / cached weight under models/; "
                         "trained = checkpoint dir under checkpoints/")
-    p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct",
+    p.add_argument("--model_name", type=str, default="Qwen_Qwen2.5-1.5B-Instruct",
                    help="HF repo id (base mode) or checkpoint folder name (trained mode)")
     p.add_argument("--temperature", type=float, default=0.5,
                    help="0.0 = greedy decoding (aligns with RAGEN API eval); "
                         "RAGEN local val uses 0.5 if you want light exploration.")
-    p.add_argument("--max_new_tokens", type=int, default=400)
-    p.add_argument("--system_prompt", type=str,
-                   default="You are a helpful reinforcement learning agent.")
+    p.add_argument("--max_new_tokens", type=int, default=256)
+    # 注：system prompt 由环境类持有（envs/base_env.py::BaseEnv.agent_system_prompt
+    # + 各子类覆盖），不再做成 CLI 参数，保证 train/eval 两侧口径自动一致。
 
     # OpenAI 专用（可选）
     p.add_argument("--api_key", type=str, default=None)
@@ -111,7 +111,6 @@ def _make_agent(args: argparse.Namespace) -> tuple[AgentConfig, object]:
         model_name_or_path=model_path,
         temperature=args.temperature,
         max_new_tokens=args.max_new_tokens,
-        system_prompt=args.system_prompt,
         api_key=args.api_key,
         base_url=args.base_url,
     )
@@ -157,7 +156,6 @@ def main() -> int:
             env=env,
             agent=agent,
             seed=env_seed,
-            system_prompt=agent_cfg.system_prompt,
             max_turn=args.max_turn,
             use_format_reward=False,  # 评估阶段只看原生环境 reward，不叠加 format penalty
             format_penalty=0.0,
@@ -172,14 +170,20 @@ def main() -> int:
         em.add_episode_from_trajectory(trajectory, success=success)
         eval_rewards.append(ep_reward)
 
-        last_info = trajectory[-1].get("info") or {}
         # 写一行 per-episode JSONL（便于事后按 episode 粒度画图 / 对比不同 ckpt）
+        # executed_action_count 是 BaseEnv.step 每 turn 覆盖写入 last_info 的字段，
+        # 所以必须对整条 trajectory 累加，才得到 episode 级的原子动作数；否则只能拿到
+        # "最后一个 turn 执行了几步" ——  和 summary 里 avg_num_actions（正确累加口径）不一致。
+        episode_num_actions = int(sum(
+            (step.get("info") or {}).get("executed_action_count", 1)
+            for step in trajectory
+        ))
         tracker.log(
             {
                 "eval/episode_reward": ep_reward,
                 "eval/episode_success": int(success),
                 "eval/episode_length": len(trajectory),
-                "eval/episode_num_actions": int(last_info.get("executed_action_count", 1)) if isinstance(last_info, dict) else 1,
+                "eval/episode_num_actions": episode_num_actions,
                 "eval/episode_seed": env_seed,
             },
             step=ep + 1,

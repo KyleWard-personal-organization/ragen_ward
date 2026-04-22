@@ -102,4 +102,7 @@ doc.md
 models/
 checkpoints/
 results/
+RAGEN-main/
 stdout.txt
+train_stdout.txt
+eval_stdout.txt

@@ -136,6 +136,20 @@ def _split_action_tokens(action_text: str) -> List[str]:
 class CartPoleEnv(GymEnvWrapper):
     """CartPole 封装。连续平衡任务 → 仅单动作语义，不支持 `||` 序列。"""
 
+    agent_system_prompt = (
+        "You are a control agent playing CartPole. Your only goal is to keep the pole "
+        "balanced upright by pushing the cart left or right. At each turn you observe "
+        "four numbers: cart position, cart velocity, pole angle, pole angular velocity. "
+        "The episode ends (failure) if the pole falls past ~±0.21 rad or the cart leaves "
+        "the ~±2.4 track. A common heuristic: push in the direction the pole is leaning "
+        "toward, weighted by the pole's angular velocity.\n"
+        "Output format is strict and non-negotiable: first reason inside "
+        "<think>...</think>, then output exactly ONE action (0 = left, 1 = right) inside "
+        "<answer>...</answer>. Any deviation from this format is treated as an invalid turn.\n"
+        "Example: <think>Pole angle is +0.05 and still increasing, push right to counter."
+        "</think><answer>1</answer>"
+    )
+
     def __init__(self, config: Any):
         config.env_name = 'CartPole-v1'
         super().__init__(config)
@@ -186,6 +200,21 @@ class SokobanEnv(GymEnvWrapper):
 
     对齐 RAGEN 论文的 `||` 动作序列：一次回复可以一次性规划多步推箱子。
     """
+
+    agent_system_prompt = (
+        "You are a spatial planning agent solving Sokoban. The grid uses: "
+        "`#`=wall, `_`=empty floor, `O`=target, `X`=box, `√`=box already on a target, "
+        "`P`=player, `S`=player standing on a target. Your goal is to push every X onto "
+        "an O so it becomes √. You can only **push** boxes (by walking into them with "
+        "free space on the other side); you cannot pull, and a box shoved into a wall "
+        "corner is often unrecoverable, so plan several moves ahead.\n"
+        "Output format is strict and non-negotiable: first reason inside "
+        "<think>...</think>, then output the action sequence inside <answer>...</answer>. "
+        "Use Up/Down/Left/Right (or 1/2/3/4) separated by `||` to execute multiple moves "
+        "in a single turn — this is strongly encouraged for efficiency.\n"
+        "Example: <think>Box at (2,3), target at (2,5). I need to approach from the left "
+        "and push right twice.</think><answer>Right || Right || Right</answer>"
+    )
 
     def __init__(self, config: Any):
         try:
@@ -341,10 +370,53 @@ class FrozenLakeEnv(GymEnvWrapper):
     FrozenLake 封装，对齐 RAGEN 网格化文本渲染 + `||` 多动作序列。
 
     默认使用 4x4 地图的确定性版本（降低小模型训练难度）。
+
+    ## Reward shaping（本地开关，不上报到 EnvConfig / CLI）
+
+    原生 FrozenLake 是"到 Goal = +1，其他一律 0"的极度稀疏奖励，对小模型 + 有限 rollout
+    量的 cold-start 极不友好（4x4 地图下 32 rollout/step 里成功样本期望 < 0.01）。把类属性
+    ``use_shaped_reward`` 切成 True 后，会在每个**非终止**原子 step 上按"曼哈顿距离变化 +
+    是否撞墙"叠一个小幅 shaping reward（量级 ±0.01 ~ ±0.05），**绝不**会盖过终点 +1 的主
+    信号；终止步（到 Goal / 掉洞）严格保持原生 reward 语义：
+
+    - 到 Goal：reward=+1.0，不叠 shaping，保留完整主信号
+    - 掉洞：  reward=0.0，不叠 shaping（不惩罚，避免模型学成"害怕探索"）
+    - 其他：  reward=原生 0.0 + shaping（见下方常量）
+
+    切换模式只需改 ``use_shaped_reward`` 一行，不用动 CLI / EnvConfig / 训练脚本。想跑 RAGEN
+    论文对齐的 sparse baseline，把它改成 False 重训即可。
     """
+
+    agent_system_prompt = (
+        "You are a spatial reasoning agent playing FrozenLake on a 4x4 grid. The grid uses: "
+        "`P`=you (the player), `_`=safe ice, `O`=hole (stepping in = episode ends with "
+        "reward 0), `G`=goal (stepping in = episode ends with reward 1), `X`=you fell into "
+        "a hole, `√`=you reached the goal. Coordinates grow **down** (row) and **right** "
+        "(column); the goal is at the bottom-right. Each move shifts you one tile; walking "
+        "into a wall leaves you in place (wasted move).\n"
+        "Output format is strict and non-negotiable: first reason inside "
+        "<think>...</think>, then output the action sequence inside <answer>...</answer>. "
+        "Use Left/Down/Right/Up (or 1/2/3/4) separated by `||` to plan multiple moves per "
+        "turn — strongly encouraged since each turn costs an LLM call.\n"
+        "Example: <think>I'm at row 0 col 0. The goal is at row 3 col 3. Row 1 col 1 is a "
+        "hole, so I'll go right twice first then down.</think>"
+        "<answer>Right || Right || Down || Down || Down</answer>"
+    )
 
     # gymnasium FrozenLake 的离散动作：0=Left, 1=Down, 2=Right, 3=Up
     _WORD_TO_GYM = {"left": 0, "down": 1, "right": 2, "up": 3}
+
+    # ------------------------------------------------------------------
+    # Reward shaping 本地开关 + 系数（见类 docstring）
+    # ------------------------------------------------------------------
+    # True  = 对非终止原子 step 叠加"距离 + 撞墙"的 shaping reward
+    # False = 完全透传 gymnasium 原生 reward（对齐 RAGEN 论文原始 FrozenLake 语义）
+    use_shaped_reward: bool = True
+
+    # shaping 系数。刻意设计成 |shaping| <<|goal reward| = 1.0，避免盖过终点主信号。
+    _SHAPING_CLOSER: float = 0.02    # 曼哈顿距离到 goal 减小（朝对方向走）
+    _SHAPING_FARTHER: float = -0.01  # 走完一步距离没减（反方向 / 平行）
+    _SHAPING_WASTE: float = -0.05    # 撞墙（curr_s == prev_s，动作未生效）
 
     def __init__(self, config: Any):
         config.env_name = 'FrozenLake-v1'
@@ -354,9 +426,17 @@ class FrozenLakeEnv(GymEnvWrapper):
         self.MAP_LOOKUP = {b"S": 1, b"F": 1, b"H": 2, b"G": 3}
         self.GRID_LOOKUP = {0: "P", 1: "_", 2: "O", 3: "G", 4: "X", 5: "√"}
 
+        # 从 desc 里查 Goal 位置（默认 4x4 地图 = (3,3)，不硬编码以兼容自定义地图 / 8x8）。
+        # 仅在 `__init__` 查一次并缓存，避免 _step_atomic 里每步都扫描 desc。
+        import numpy as np
+        goal_positions = np.argwhere(self.env.unwrapped.desc == b'G')
+        assert len(goal_positions) > 0, "FrozenLake map has no Goal cell"
+        self._goal_row: int = int(goal_positions[0][0])
+        self._goal_col: int = int(goal_positions[0][1])
+
     def _step_atomic(self, gym_action: Optional[int]) -> Tuple[str, float, bool, bool, dict]:
         # FrozenLake 的"成功"语义：踩到 Goal（唯一能给出 reward=1.0 的终止情形）。
-        # 掉洞同样是 terminated=True 但 reward=0.0，绝不能算作功。
+        # 掉洞同样是 terminated=True 但 reward=0.0，绝不能算作成功。
         # 同时在这里顺便判 action_is_effective：gymnasium 的 FrozenLake obs 就是玩家
         # 的格子索引（self.env.unwrapped.s）——step 前后位置不变即"撞墙/出界"，即
         # 动作未生效。
@@ -371,8 +451,39 @@ class FrozenLakeEnv(GymEnvWrapper):
             info["is_success"] = False
 
         curr_s = int(self.env.unwrapped.s)
-        info["action_is_effective"] = bool(curr_s != prev_s)
-        return obs, reward, terminated, truncated, info
+        action_effective = bool(curr_s != prev_s)
+        info["action_is_effective"] = action_effective
+
+        # Reward shaping（仅在非终止步上叠加；终止步保持原生 reward 语义，详见类 docstring）。
+        if self.use_shaped_reward and not terminated:
+            shaping = self._compute_shaping_reward(prev_s, curr_s, action_effective)
+            reward = float(reward) + shaping
+            info["reward_shaping"] = shaping
+
+        return obs, float(reward), terminated, truncated, info
+
+    def _compute_shaping_reward(self, prev_s: int, curr_s: int, action_effective: bool) -> float:
+        """
+        基于位置变化计算一次 atomic step 的 shaping reward。
+
+        规则（按优先级）：
+        1. 撞墙（action_is_effective=False）→ ``_SHAPING_WASTE``
+        2. 曼哈顿距离到 goal 减小 → ``_SHAPING_CLOSER``
+        3. 其他（距离不变 / 变远）→ ``_SHAPING_FARTHER``
+        """
+        if not action_effective:
+            return self._SHAPING_WASTE
+
+        ncol = int(self.env.unwrapped.ncol)
+        prev_row, prev_col = prev_s // ncol, prev_s % ncol
+        curr_row, curr_col = curr_s // ncol, curr_s % ncol
+
+        prev_dist = abs(prev_row - self._goal_row) + abs(prev_col - self._goal_col)
+        curr_dist = abs(curr_row - self._goal_row) + abs(curr_col - self._goal_col)
+
+        if curr_dist < prev_dist:
+            return self._SHAPING_CLOSER
+        return self._SHAPING_FARTHER
 
     def _format_obs(self, obs: Any) -> str:
         import numpy as np

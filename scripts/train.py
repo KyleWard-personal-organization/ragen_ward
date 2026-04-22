@@ -28,7 +28,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 让本次运行的所有 stdout + stderr 同步写入 <PROJECT_ROOT>/stdout.txt。
 # mode="w": 每次启动清空文件，只保留"最近一次"运行（train/evaluate 共用此文件）。
 from utils.stdout_tee import setup_stdout_tee  # noqa: E402
-setup_stdout_tee("stdout.txt", mode="w")
+setup_stdout_tee("train_stdout.txt", mode="w")
 
 from configs.config import (
     ExperimentConfig,
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ---- 运行总控 ----
-    p.add_argument("--exp_name", type=str, default="train_default",
+    p.add_argument("--exp_name", type=str, default="Qwen_Qwen2.5-1.5B-Instruct_60",
                    help="Experiment name used for log file / checkpoint dir naming")
     p.add_argument("--seed", type=int, default=42)
 
@@ -74,10 +74,10 @@ def parse_args() -> argparse.Namespace:
     # ---- Agent ----
     p.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
                    help="HuggingFace model path or repo id (local path preferred to skip download)")
-    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--max_new_tokens", type=int, default=256)
-    p.add_argument("--system_prompt", type=str,
-                   default="You are a helpful reinforcement learning agent.")
+    # 注：system prompt 由环境类持有（envs/base_env.py::BaseEnv.agent_system_prompt
+    # + 各子类覆盖），不再做成 CLI 参数，避免换 env 时忘记同步改 CLI。
 
     # ---- 训练器 / 算法选择 ----
     p.add_argument("--trainer", type=str, default="starpo", choices=["starpo", "pure"],
@@ -85,11 +85,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--algo", type=str, default="ppo", choices=["ppo", "grpo"])
 
     # ---- 训练循环 ----
-    p.add_argument("--total_training_steps", type=int, default=200,
+    p.add_argument("--total_training_steps", type=int, default=60,
                    help="Each step = 1 rollout phase + 1 RL update")
-    p.add_argument("--eval_interval", type=int, default=20,
+    p.add_argument("--eval_interval", type=int, default=10,
                    help="Run evaluation every N training steps")
-    p.add_argument("--eval_episodes", type=int, default=8,
+    p.add_argument("--eval_episodes", type=int, default=30,
                    help="Number of episodes per evaluation")
     p.add_argument("--save_interval", type=int, default=100,
                    help="Save checkpoint every N training steps")
@@ -99,15 +99,14 @@ def parse_args() -> argparse.Namespace:
                    help="Reserved for future fast/slow implementation switching")
     p.add_argument("--num_rollouts", type=int, default=8,
                    help="Number of trajectories sampled per prompt (GRPO group size)")
-    p.add_argument("--prompt_batch_size", type=int, default=1,
+    p.add_argument("--prompt_batch_size", type=int, default=4,
                    help="Number of different prompts per training step "
                         "(effective batch = prompt_batch_size * num_rollouts)")
-    p.add_argument("--use_format_reward", action="store_true", default=True)
     p.add_argument("--no_format_reward", dest="use_format_reward", action="store_false")
     p.add_argument("--format_penalty", type=float, default=-0.1)
-    p.add_argument("--variance_filter_ratio", type=float, default=0.25,
+    p.add_argument("--variance_filter_ratio", type=float, default=1.0,
                    help="Keep top-k ratio by group variance (StarPO-S; only used when trainer=starpo)")
-    p.add_argument("--max_turn", type=int, default=2,
+    p.add_argument("--max_turn", type=int, default=5,
                    help="Max LLM turns (chat_request calls) per trajectory. Aligns with RAGEN "
                         "`agent_proxy.max_turn`. This is the *turn*-level budget, independent from "
                         "--max_env_steps (the atomic env-step budget): whichever hits first "
@@ -120,7 +119,13 @@ def parse_args() -> argparse.Namespace:
     # ---- RL 算法通用超参 ----
     p.add_argument("--learning_rate", type=float, default=1e-6)
     p.add_argument("--ppo_epochs", type=int, default=1)
-    p.add_argument("--mini_batch_size", type=int, default=2)
+    p.add_argument("--micro_batch_size", type=int, default=1,
+                   help="Per-backward sample count (VRAM peak driver). "
+                        "Equivalent to RAGEN's ppo_micro_batch_size_per_gpu.")
+    p.add_argument("--gradient_accumulation", type=int, default=8,
+                   help="Gradient accumulation steps; 1 disables accumulation (immediate step per micro-batch). "
+                        "Logical mini-batch = micro_batch_size * gradient_accumulation, "
+                        "matching RAGEN's ppo_mini_batch_size convention.")
     p.add_argument("--clip_ratio", type=float, default=0.2)
     p.add_argument("--vf_coef", type=float, default=0.5,
                    help="Critic loss coefficient (PPO only)")
@@ -130,12 +135,9 @@ def parse_args() -> argparse.Namespace:
                         "0.0 corresponds to the ppo-nokl ablation setting")
     p.add_argument("--target_kl", type=float, default=None,
                    help="Early stopping KL threshold; leave unset to disable")
-    p.add_argument("--max_seq_length", type=int, default=4096,
+    p.add_argument("--max_seq_length", type=int, default=2048,
                    help="Max total token length after concatenating whole trajectory")
 
-    p.add_argument("--use_ref", action="store_true", default=True,
-                   help="Create a frozen reference model (deepcopy of actor) and apply KL penalty. "
-                        "Default True to align with RAGEN's actor_rollout_ref.actor.use_ref=True.")
     p.add_argument("--no_use_ref", dest="use_ref", action="store_false",
                    help="Disable reference model entirely; forces kl_coef=0 and saves ~1GB VRAM, "
                         "at the cost of losing the KL anchor (risk of reward hacking / policy collapse).")
@@ -151,7 +153,7 @@ def parse_args() -> argparse.Namespace:
                    help="token-level discount")
     p.add_argument("--lam", type=float, default=1.0,
                    help="GAE lambda")
-    p.add_argument("--bi_level_gae", action="store_true",
+    p.add_argument("--no_bi_level_gae", action="store_false", dest="bi_level_gae",
                    help="Enable bi-level GAE (turn-level + token-level)")
     p.add_argument("--high_level_gamma", type=float, default=0.95,
                    help="Turn-level discount; only used when bi_level_gae is enabled")
@@ -183,7 +185,6 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         model_name_or_path=args.model,
         temperature=args.temperature,
         max_new_tokens=args.max_new_tokens,
-        system_prompt=args.system_prompt,
     )
     algo_cfg = RLAlgoConfig(
         algo_name=args.algo,
@@ -193,7 +194,8 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         bi_level_gae=args.bi_level_gae,
         high_level_gamma=args.high_level_gamma,
         ppo_epochs=args.ppo_epochs,
-        mini_batch_size=args.mini_batch_size,
+        micro_batch_size=args.micro_batch_size,
+        gradient_accumulation=args.gradient_accumulation,
         clip_ratio=args.clip_ratio,
         vf_coef=args.vf_coef,
         ent_coef=args.ent_coef,
@@ -251,7 +253,7 @@ def main() -> int:
     config = build_config(args)
     env = make_env(config.env_config)
     agent = HFAgent(config.agent_config)
-    assert False
+
     algo = make_algo(config.rl_algo_config, agent)
 
     if args.trainer == "starpo":

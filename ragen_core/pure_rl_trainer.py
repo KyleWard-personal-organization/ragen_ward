@@ -63,12 +63,12 @@ class PureRLTrainer:
     # ----------------------------------------------------------------
 
     def _rollout_one_trajectory(self, seed: Optional[int]) -> List[Dict[str, Any]]:
-        """对给定 seed 采样一条完整 trajectory（委托给公共 rollout 工具，禁用 format reward）。"""
+        """对给定 seed 采样一条完整 trajectory（委托给公共 rollout 工具，禁用 format reward）。
+        system prompt 由 env.agent_system_prompt 提供，rollout_utils 内部直接读。"""
         return rollout_one_trajectory(
             env=self.env,
             agent=self.agent,
             seed=seed,
-            system_prompt=self.agent.config.system_prompt,
             max_turn=self.max_turn,
             use_format_reward=False,  # PureRL baseline: 不加格式惩罚
             format_penalty=0.0,
