@@ -208,6 +208,11 @@ class GRPO(BaseRLAlgo):
         stats = {
             "actor_loss": 0.0, "entropy": 0.0, "kl_penalty": 0.0,
             "approx_kl": 0.0, "clip_frac": 0.0, "n_updates": 0,
+            # ---- Gradient norm 相关（对齐 RAGEN paper Figure 6 ③ Gradient Norm）----
+            # grad_norm:     按 optimizer step 取均值（趋势线，对应论文 EMA-smoothed 曲线）
+            # grad_norm_max: 本次 train_step 内所有 optimizer step 的 max（spike detection 用）
+            # n_grad_steps:  本次 train_step 实际触发 optimizer.step 的次数（用于求均值）
+            "grad_norm": 0.0, "grad_norm_max": 0.0, "n_grad_steps": 0,
             "group_adv_mean": float(torch.tensor([d["group_adv_scalar"] for d in data]).mean().item()),
             "group_adv_std": float(torch.tensor([d["group_adv_scalar"] for d in data]).std(unbiased=False).item()),
         }
@@ -270,9 +275,16 @@ class GRPO(BaseRLAlgo):
                 accum_counter += 1
                 is_last_micro = (i + self.micro_batch_size >= len(data))
                 if (accum_counter % self.gradient_accumulation == 0) or is_last_micro:
-                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                    # clip_grad_norm_ 的返回值是**裁剪前**的 ℓ2 total norm，
+                    # 这正好是论文 Figure 6 ③ "Gradient Norm" 想要的量（spike detection
+                    # 必须看 pre-clip，否则 clip 会把所有 spike 都压成 max_norm=1.0 看不出来）。
+                    raw_total_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    gn = float(raw_total_norm)
+                    stats["grad_norm"] += gn
+                    stats["grad_norm_max"] = max(stats["grad_norm_max"], gn)
+                    stats["n_grad_steps"] += 1
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - (new_log_probs - old_log_probs)) * mask
@@ -296,6 +308,9 @@ class GRPO(BaseRLAlgo):
         n = max(1, stats["n_updates"])
         for k in ["actor_loss", "entropy", "kl_penalty", "approx_kl", "clip_frac"]:
             stats[k] = stats[k] / n
+        # grad_norm 用 optimizer.step 实际触发次数取均值（不是 micro_batch 数）
+        n_g = max(1, stats["n_grad_steps"])
+        stats["grad_norm"] = stats["grad_norm"] / n_g
 
         # ⚠️ 必须切回 eval 模式：train_step 结束后 trainer 会进入下一轮 rollout（model.generate）。
         # 如果留在 train 模式，Qwen2 forward 内部 `if self.gradient_checkpointing and self.training:`

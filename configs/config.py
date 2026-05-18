@@ -78,7 +78,8 @@ class RLAlgoConfig:
     以节省约 2GB 的 optimizer state 显存；复现论文时可显式切回 ``adamw``。
     """
     algo_name: str                                     # "ppo" / "grpo"
-    learning_rate: float                               # AdamW 学习率
+    learning_rate: float                               # Actor lr（论文 0.5B baseline = 1e-6）
+    critic_learning_rate: float                        # Critic lr（论文 0.5B baseline = 1e-5；GRPO 忽略此字段）
     gamma: float                                       # token 级折扣因子
     lam: float                                         # GAE λ
     bi_level_gae: bool                                 # 是否开启 turn 级 + token 级 双层 GAE

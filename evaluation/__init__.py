@@ -10,12 +10,12 @@ from .metrics import (
     EvaluatorMetrics,
     extract_episode_metrics,
     compute_reward_variance,
-    check_echo_trap_signs,
+    compute_in_group_reward_std,
 )
 
 __all__ = [
     "EvaluatorMetrics",
     "extract_episode_metrics",
     "compute_reward_variance",
-    "check_echo_trap_signs",
+    "compute_in_group_reward_std",
 ]

@@ -316,7 +316,7 @@ python scripts/train.py --exp_name phaseB_PR_4x2 --env frozenlake --trainer star
 - `train/raw_reward_mean` 的**斜率**（回归直线斜率 > 0）
 - `eval/format_compliance` 的 **5 个 eval 点**是否单调上升
 - `eval/reward_variance` **上升**意味着"有些 rollout 开始能拿到奖励"，这是好事（并非越低越好）
-- `train/entropy` 不能**急剧塌缩**（`echo_trap_sign` 应为 False）
+- `train/entropy` 不能**急剧塌缩**（事后画图：`train/in_group_reward_std` 不应在 log 尺度上骤降一个数量级；`train/grad_norm_max` 不应出现持续 spike）
 
 **二级信号（作为一级的辅助）**：
 - `train/approx_kl` < 0.5 即正常
@@ -385,7 +385,7 @@ python scripts/train.py --exp_name phaseB_PR_4x2 --env frozenlake --trainer star
 | ✓ | `checkpoints/phaseC_final_*/` 至少保存 1 个 checkpoint |
 | ✓ | `eval/format_compliance` (final) > Stage 1 base 对应值（Stage 1 是 0.0，几乎必定 ✓） |
 | ⭐ | `eval/success_rate` (final) > 0.1（期望目标，不是必达）|
-| ⭐ | `train/entropy` 未出现 Echo Trap（`echo_trap_sign=False` 全程） |
+| ⭐ | 事后画图（4 联图）未观测到 Echo Trap：`in_group_reward_std` 不在 log 尺度骤降一个数量级且不再回升、`grad_norm_max` 不出现持续 spike、`entropy` 不急剧塌缩 |
 
 #### 时间预算
 

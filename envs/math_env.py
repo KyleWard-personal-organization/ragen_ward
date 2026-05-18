@@ -14,22 +14,23 @@ from .base_env import BaseEnv
 
 
 class MathEnv(BaseEnv):
+    """
+    路径 A 论文对齐：Countdown 单轮一次决策 → max_actions_per_traj=1，
+    env_instruction 一句话级别（对齐 RAGEN ``config/envs.yaml::Countdown`` 风格）。
+    grid_vocab/action_lookup=None：表达式没有固定符号集合，全靠模型自由生成。
+    """
 
-    agent_system_prompt = (
-        "You are a mathematical reasoning agent solving the Countdown puzzle. You are "
-        "given a list of 4 integers and a target integer; build a single arithmetic "
-        "expression using **each given number exactly once** (no reuse, no extra "
-        "numbers) together with +, -, *, / and parentheses, such that the expression "
-        "evaluates to the target. Integer division is fine but avoid it unless the "
-        "division is exact. Always verify your candidate by computing it mentally "
-        "before committing. This is a one-shot task: the episode ends whether you are "
-        "right or wrong.\n"
-        "Output format is strict and non-negotiable: show the derivation inside "
-        "<think>...</think>, then output ONLY the final expression (no `=`, no "
-        "explanation, no leading 'Answer:') inside <answer>...</answer>.\n"
-        "Example: <think>Target 14 from [2,3,4,5]: try 2+3+4+5 = 14. That matches.</think>"
-        "<answer>2 + 3 + 4 + 5</answer>"
+    # ---- 路径 A：论文风格 prompt 五件套 ----
+    env_instruction = (
+        "You are solving the Countdown puzzle. Combine the given numbers with "
+        "+, -, *, /, and parentheses so the expression evaluates exactly to the "
+        "target. Use each number exactly once. Output only the final expression "
+        "inside <answer>...</answer>."
     )
+    grid_vocab = None
+    action_lookup = None
+    max_actions_per_traj = 1
+    max_response_tokens = 100
 
     def __init__(self, config: Any):
         super().__init__(config)
@@ -125,18 +126,3 @@ class MathEnv(BaseEnv):
 
     def render(self) -> Any:
         print(self.problem_str)
-
-    def get_valid_actions(self) -> str:
-        return "Please output a valid mathematical expression using the given numbers inside an <answer> tag."
-
-    def get_env_instruction(self) -> str:
-        return (
-            "You are solving a Countdown puzzle. Combine the given numbers with "
-            "+, -, *, /, and parentheses to hit the target exactly. Each number "
-            "must be used exactly once. This is a one-shot answer: the task ends "
-            "immediately after you submit, correct or not.\n"
-            "**Answer format**: wrap the final expression in <answer>...</answer>.\n"
-            "Example: <think>Target 14 from [2,3,4,5]: (3-2)*4+5*2? Too complex; try "
-            "2*5+4-3=11, no... 5*3+4-2=17, no... 2+3+4+5=14.</think>"
-            "<answer>2 + 3 + 4 + 5</answer>"
-        )

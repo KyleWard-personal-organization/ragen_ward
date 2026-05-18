@@ -107,9 +107,16 @@ ragen_ward/
 - (可选) wandb（在代码里把 `use_wandb=True` 即可）
 
 常见指标：
-- 训练：`train/actor_loss`、`train/critic_loss`、`train/entropy`、`train/kl_penalty`、`train/approx_kl`、`train/clip_frac`、`train/raw_reward_mean`、`train/raw_reward_var`、`train/echo_trap_sign`
+- 训练（对齐 RAGEN paper Figure 6 四大 collapse indicators）：
+  - **① Average Reward**：`train/raw_reward_mean`
+  - **② In-Group Reward Std**：`train/in_group_reward_std`（同 prompt 内 R 条 rollout 的 std 再均值，echo trap 早期预警指标）
+  - **③ Gradient Norm**：`train/grad_norm`（mean 趋势线）+ `train/grad_norm_max`（spike detection）
+  - **④ Entropy Loss**：`train/entropy`
+- 训练（其他）：`train/actor_loss`、`train/critic_loss`、`train/kl_penalty`、`train/approx_kl`、`train/clip_frac`、`train/raw_reward_var`
 - 评估：`eval/success_rate`、`eval/avg_reward`、`eval/avg_trajectory_length`、`eval/reward_variance`
 - 时序：`timing/rollout_sec`、`timing/update_sec`
+
+> 所有指标都已经如实写入 `logs/<exp_name>/metrics.jsonl`（每行一个 step），可直接喂给 pandas + matplotlib 复现论文 Figure 6 风格的 4 联图（不再依赖在线判定的 `echo_trap_sign` 布尔值——那个粗糙启发式已弃用）。
 
 ---
 

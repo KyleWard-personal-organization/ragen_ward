@@ -46,9 +46,14 @@ from envs import make_env
 from agents.hf_agent import HFAgent
 from agents.openai_agent import OpenAIAgent
 from evaluation.metrics import EvaluatorMetrics, compute_reward_variance
-from ragen_core.rollout_utils import judge_success, rollout_one_trajectory
+from ragen_core.rollout_utils import (
+    batched_rollout_for_prompt,
+    judge_success,
+    rollout_one_trajectory,
+)
 from utils.logger import setup_logger, logger
 from utils.tracker import TrainingTracker
+from tqdm import tqdm
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,6 +91,15 @@ def parse_args() -> argparse.Namespace:
                    help="0.0 = greedy decoding (aligns with RAGEN API eval); "
                         "RAGEN local val uses 0.5 if you want light exploration.")
     p.add_argument("--max_new_tokens", type=int, default=256)
+    p.add_argument("--eval_batch_size", type=int, default=8,
+                   help="Batch size for batched rollout in evaluation. Each batch creates "
+                        "B independent env instances and runs B trajectories in parallel "
+                        "via agent.batched_chat_request — same speedup mechanism as the "
+                        "training-side collect_rollouts. Defaults to 8 (matches the typical "
+                        "training-time num_rollouts=R, so VRAM footprint is identical). "
+                        "If episodes is not divisible by eval_batch_size, the last batch is "
+                        "naturally smaller (no padding, no episode loss). Set to 1 to fall "
+                        "back to fully sequential rollout (e.g. for OpenAI API agent).")
     # 注：system prompt 由环境类持有（envs/base_env.py::BaseEnv.agent_system_prompt
     # + 各子类覆盖），不再做成 CLI 参数，保证 train/eval 两侧口径自动一致。
 
@@ -128,12 +142,12 @@ def main() -> int:
         f"max_env_steps={args.max_env_steps} temperature={args.temperature}"
     )
 
-    # 1) env + agent
+    # 1) env_cfg + agent（不再创建全局 env：batched 路径每个 batch 现造 B 个独立 env，
+    #    sequential fallback 也按需创建 1 个临时 env，避免长生命周期 env 在 process 内残留状态。）
     env_cfg = EnvConfig(
         env_name=args.env,
         max_steps=args.max_env_steps,
     )
-    env = make_env(env_cfg)
     agent_cfg, agent = _make_agent(args)
 
     # 2) 指标聚合器 + 持久化 tracker
@@ -144,54 +158,78 @@ def main() -> int:
     # 3) seed 策略：默认随机（和 StarPOTrainer.evaluate 对齐），fixed_seed_base 仅用于复现 debug
     rng = random.Random(args.seed)
 
-    # 4) 评估循环：每一轮一条完整 trajectory，由 ragen_core.rollout_one_trajectory 统一构造
-    #    —— 与 StarPO/PureRL 训练器内评估逻辑同源，口径完全一致。
-    for ep in range(args.episodes):
+    # 4) 评估循环：batched 版本
+    #    —— 与 StarPOTrainer.evaluate / PureRLTrainer.evaluate 共用 batched_rollout_for_prompt，
+    #       同 prompt 内复用 batch generate 拿到 3-5x rollout 加速。
+    #    —— eval_batch_size=1 时退化为完全串行（用于 OpenAI API agent，或 debug 时禁用 batch）。
+    #    —— episodes 不被 eval_batch_size 整除时，最后一个 batch 自然变小（无 padding，无 episode 丢失）。
+    B = max(1, int(args.eval_batch_size))
+    n_eval = int(args.episodes)
+    ep_global = 0  # 全局 episode 计数器，保证 JSONL 的 step 列单调递增
+
+    pbar = tqdm(total=n_eval, desc=f"Evaluating (batched, B={B})")
+    for start in range(0, n_eval, B):
+        actual_b = min(B, n_eval - start)
+
+        # 生成本 batch 的 seeds —— fixed_seed_base 模式下用 base + 全局偏移，保证可复现
         if args.fixed_seed_base is not None:
-            env_seed = args.fixed_seed_base + ep
+            seeds = [args.fixed_seed_base + ep_global + k for k in range(actual_b)]
         else:
-            env_seed = rng.randint(0, 2**31 - 1)
+            seeds = [rng.randint(0, 2**31 - 1) for _ in range(actual_b)]
 
-        trajectory = rollout_one_trajectory(
-            env=env,
-            agent=agent,
-            seed=env_seed,
-            max_turn=args.max_turn,
-            use_format_reward=False,  # 评估阶段只看原生环境 reward，不叠加 format penalty
-            format_penalty=0.0,
-        )
-        if not trajectory:
-            logger.warning(f"Episode {ep+1}/{args.episodes} produced an empty trajectory, skipped.")
-            continue
+        envs = [make_env(env_cfg) for _ in range(actual_b)]
+        try:
+            trajs = batched_rollout_for_prompt(
+                envs=envs,
+                agent=agent,
+                seed=seeds,  # list 形式：每个 env 用对应位置的独立 seed
+                max_turn=args.max_turn,
+                use_format_reward=False,  # 评估阶段只看原生环境 reward，不叠加 format penalty
+                format_penalty=0.0,
+            )
+        finally:
+            for env in envs:
+                try:
+                    env.close()
+                except Exception:
+                    pass
 
-        ep_reward = float(sum(step["env_reward"] for step in trajectory))
-        success = judge_success(trajectory)
+        # 逐条 traj 写 per-episode JSONL —— 与原版串行实现的写出 schema 完全一致
+        for env_seed, trajectory in zip(seeds, trajs):
+            ep_global += 1
+            pbar.update(1)
+            if not trajectory:
+                logger.warning(f"Episode {ep_global}/{n_eval} produced an empty trajectory, skipped.")
+                continue
 
-        em.add_episode_from_trajectory(trajectory, success=success)
-        eval_rewards.append(ep_reward)
+            ep_reward = float(sum(step["env_reward"] for step in trajectory))
+            success = judge_success(trajectory)
 
-        # 写一行 per-episode JSONL（便于事后按 episode 粒度画图 / 对比不同 ckpt）
-        # executed_action_count 是 BaseEnv.step 每 turn 覆盖写入 last_info 的字段，
-        # 所以必须对整条 trajectory 累加，才得到 episode 级的原子动作数；否则只能拿到
-        # "最后一个 turn 执行了几步" ——  和 summary 里 avg_num_actions（正确累加口径）不一致。
-        episode_num_actions = int(sum(
-            (step.get("info") or {}).get("executed_action_count", 1)
-            for step in trajectory
-        ))
-        tracker.log(
-            {
-                "eval/episode_reward": ep_reward,
-                "eval/episode_success": int(success),
-                "eval/episode_length": len(trajectory),
-                "eval/episode_num_actions": episode_num_actions,
-                "eval/episode_seed": env_seed,
-            },
-            step=ep + 1,
-        )
-        logger.info(
-            f"Episode {ep+1}/{args.episodes} | seed={env_seed} "
-            f"reward={ep_reward:.4f} success={success} length={len(trajectory)}"
-        )
+            em.add_episode_from_trajectory(trajectory, success=success)
+            eval_rewards.append(ep_reward)
+
+            # executed_action_count 是 BaseEnv.step 每 turn 覆盖写入 last_info 的字段，
+            # 所以必须对整条 trajectory 累加，才得到 episode 级的原子动作数；否则只能拿到
+            # "最后一个 turn 执行了几步" —— 和 summary 里 avg_num_actions（正确累加口径）不一致。
+            episode_num_actions = int(sum(
+                (step.get("info") or {}).get("executed_action_count", 1)
+                for step in trajectory
+            ))
+            tracker.log(
+                {
+                    "eval/episode_reward": ep_reward,
+                    "eval/episode_success": int(success),
+                    "eval/episode_length": len(trajectory),
+                    "eval/episode_num_actions": episode_num_actions,
+                    "eval/episode_seed": env_seed,
+                },
+                step=ep_global,
+            )
+            logger.info(
+                f"Episode {ep_global}/{n_eval} | seed={env_seed} "
+                f"reward={ep_reward:.4f} success={success} length={len(trajectory)}"
+            )
+    pbar.close()
 
     # 5) 汇总：对齐 RAGEN es_manager.get_rollout_states 的字段
     summary = em.summary()

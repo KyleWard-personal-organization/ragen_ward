@@ -163,21 +163,48 @@ class EvaluatorMetrics:
 
 
 def compute_reward_variance(rewards: List[float]) -> float:
-    """辅助函数：计算奖励方差（StarPO-S 核心过滤指标 / Echo Trap 预警信号）。"""
+    """辅助函数：计算 reward 方差。
+
+    注意：这是"整批 rewards 的全局方差"（cross-prompt + within-prompt 混合）。
+    论文 Figure 6 的"In-Group Reward Std"是**同一 prompt 下 R 条 rollout 的 std**，
+    跟此函数的语义不同；后者用 ``compute_in_group_reward_std``。
+    """
     if not rewards:
         return 0.0
     return float(np.var(rewards))
 
 
-def check_echo_trap_signs(reward_variances: List[float], entropies: List[float]) -> bool:
-    """
-    检测是否陷入"回声陷阱"(Echo Trap)：
-    当奖励方差骤降且输出熵急剧减少时，往往预示着模型正在陷入局部捷径。
-    """
-    if len(reward_variances) < 5 or len(entropies) < 5:
-        return False
+def compute_in_group_reward_std(returns: List[float], group_size: int) -> float:
+    """In-Group Reward Standard Deviation —— RAGEN 论文 Figure 6 的指标 ②。
 
-    var_trend = np.mean(reward_variances[-3:]) < np.mean(reward_variances[:3]) * 0.1
-    entropy_trend = np.mean(entropies[-3:]) < np.mean(entropies[:3]) * 0.5
+    对应论文定义（§4.1 Finding 3 / Appendix B.3）：
+        "In-Group Reward Variance. Measures reward standard deviation across rollouts
+         sampled from the same prompt group. High in-group variance reflects diverse
+         behaviors and learning potential; a sudden collapse indicates reward
+         homogenization and policy stagnation."
 
-    return bool(var_trend and entropy_trend)
+    实现细节：
+    - 把 ``returns`` 按 ``group_size`` 切成 N 组（N = len(returns) // group_size）。
+    - 每组内算 std（注意是 std 不是 var，跟论文 Figure 6 的纵轴单位一致）。
+    - 对 N 个 group-std 取算术平均，作为该 step 的 In-Group Reward Std 标量。
+    - 若 group_size <= 1（PureRL 不分组场景）或 returns 空，退化为整体 std。
+
+    这才是"echo trap early warning"的论文级指标——当它在 log 尺度上 sharp drop 一个数量级
+    且不再回升时，说明 policy 已经在同 prompt 下产生高度同质化的 trajectory，是 collapse
+    早期信号（论文 FrozenLake-PPO 在 step 40 出现这个信号，比 reward mean 崩盘早 50 步）。
+    """
+    if not returns:
+        return 0.0
+    if group_size <= 1:
+        return float(np.std(returns))
+    num_groups = len(returns) // group_size
+    if num_groups == 0:
+        return float(np.std(returns))
+    group_stds = []
+    for i in range(num_groups):
+        group_returns = returns[i * group_size : (i + 1) * group_size]
+        if len(group_returns) >= 2:
+            group_stds.append(float(np.std(group_returns)))
+    if not group_stds:
+        return 0.0
+    return float(np.mean(group_stds))

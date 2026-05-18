@@ -22,12 +22,23 @@ import torch, gc
 
 import numpy as np
 
-from .rollout_utils import check_format, judge_success, rollout_one_trajectory
+from .rollout_utils import (
+    batched_rollout_for_prompt,
+    check_format,
+    judge_success,
+    rollout_one_trajectory,
+)
+from envs import make_env
 from .trajectory_buffer import TrajectoryBuffer
 from configs.constants import CKPT_DIR
 from utils.logger import logger
 from utils.tracker import TrainingTracker
-from evaluation.metrics import EvaluatorMetrics, compute_reward_variance, check_echo_trap_signs
+from evaluation.metrics import (
+    EvaluatorMetrics,
+    compute_reward_variance,
+    compute_in_group_reward_std,
+)
+from tqdm import tqdm
 
 
 class StarPOTrainer:
@@ -80,10 +91,6 @@ class StarPOTrainer:
             use_wandb=False,
         )
 
-        # ---- Echo Trap 检测用的滑动指标 ----
-        self.history_reward_var: List[float] = []
-        self.history_entropy: List[float] = []
-
         logger.info(
             f"Initialized StarPOTrainer | total_training_steps={self.total_training_steps} "
             f"eval_interval={self.eval_interval} num_rollouts={self.num_rollouts} "
@@ -117,11 +124,50 @@ class StarPOTrainer:
             format_penalty=self.format_penalty,
         )
 
+    # ----------------------------------------------------------------
+    # Rollout 后端开关：True = 同 prompt 内 R 条 trajectory batch generate（推荐）
+    # 数学上严格等价于串行版本（见 batched_rollout_for_prompt docstring），
+    # 仅作为"出意外时一行回滚"的逃生通道存在；正式训练应保持 True。
+    # ----------------------------------------------------------------
+    _USE_BATCHED_ROLLOUT: bool = True
+
     def collect_rollouts(self, prompt_states: List[Dict[str, Any]]) -> None:
         """对每个 prompt 采 num_rollouts 条轨迹放入 buffer。"""
+        if self._USE_BATCHED_ROLLOUT:
+            self._collect_rollouts_batched(prompt_states)
+        else:
+            self._collect_rollouts_sequential(prompt_states)
+
+    def _collect_rollouts_batched(self, prompt_states: List[Dict[str, Any]]) -> None:
+        """同 prompt 内 R 条 traj 凑 batch 调 batched_chat_request；prompt 间仍串行。
+        每个 prompt 临时构造 num_rollouts 个独立 env 实例，结束后立刻 close。"""
+        env_cfg = self.config.env_config
+        for state_info in tqdm(prompt_states, desc="Collecting rollouts (batched)"):
+            seed = state_info.get("seed") if isinstance(state_info, dict) else None
+            envs = [make_env(env_cfg) for _ in range(self.num_rollouts)]
+            try:
+                trajs = batched_rollout_for_prompt(
+                    envs=envs,
+                    agent=self.agent,
+                    seed=seed,
+                    max_turn=self.max_turn,
+                    use_format_reward=self.use_format_reward,
+                    format_penalty=self.format_penalty,
+                )
+                for traj in trajs:
+                    if len(traj) > 0:
+                        self.buffer.add_trajectory(traj)
+            finally:
+                for env in envs:
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
+
+    def _collect_rollouts_sequential(self, prompt_states: List[Dict[str, Any]]) -> None:
+        """原始串行实现，作为 _USE_BATCHED_ROLLOUT=False 时的 fallback / 对比 baseline。"""
         for state_info in prompt_states:
             seed = state_info.get("seed") if isinstance(state_info, dict) else None
-            from tqdm import tqdm
             for _ in tqdm(range(self.num_rollouts), desc="Collecting rollouts"):
                 traj = self._rollout_one_trajectory(seed)
                 if len(traj) > 0:
@@ -144,19 +190,27 @@ class StarPOTrainer:
         self.collect_rollouts(prompt_states)
         t_rollout = time.time() - t0
 
-        # 采完的原始 reward 统计（过滤前）
+        # 采完的原始 reward 统计（过滤前）—— 三类口径：
+        #   raw_reward_mean       对齐论文 Figure 6 ① Average Reward
+        #   in_group_reward_std   对齐论文 Figure 6 ② In-Group Reward Std（按 prompt 分组算 std 再均值）
+        #   raw_reward_var        cross-prompt + within-prompt 混合方差（保留作 supplemental，非论文核心指标）
         raw_returns = self.buffer.compute_returns()
         raw_reward_mean = float(np.mean(raw_returns)) if raw_returns else 0.0
         raw_reward_var = float(np.var(raw_returns)) if raw_returns else 0.0
+        in_group_reward_std = compute_in_group_reward_std(raw_returns, self.num_rollouts)
 
         # (b) 方差过滤（StarPO-S 稳定化）
-        original_size = len(self.buffer.trajectories)
+        size_before = len(self.buffer.trajectories)
         self.buffer.filter_by_variance(
             group_size=self.num_rollouts,
             retain_ratio=self.variance_filter_ratio,
         )
-        filtered_size = len(self.buffer.trajectories)
-        logger.info(f"[StarPO step={step_idx}] variance filter: {original_size} -> {filtered_size}")
+        size_after = len(self.buffer.trajectories)
+        # 只在 filter 真正生效（删了至少 1 条 traj）时打 log，避免 baseline filter=1.0 刷屏
+        if size_after != size_before:
+            logger.info(
+                f"[StarPO step={step_idx}] variance filter: {size_before} -> {size_after}"
+            )
 
         # (c) RL 更新
         metrics: Dict[str, Any] = {}
@@ -169,21 +223,15 @@ class StarPOTrainer:
             logger.warning("[StarPO] No trajectories left after filter, skipping update.")
             t_update = 0.0
 
-        # (d) 汇总指标
-        # Echo Trap 检测
-        self.history_reward_var.append(raw_reward_var)
-        if "entropy" in metrics:
-            self.history_entropy.append(float(metrics["entropy"]))
-        echo_trap = check_echo_trap_signs(self.history_reward_var, self.history_entropy) \
-            if len(self.history_entropy) >= 5 else False
-
+        # (d) 汇总指标 —— 对齐 RAGEN paper Figure 6 的 4 个 collapse indicators：
+        #   ① Average Reward      = train/raw_reward_mean
+        #   ② In-Group Reward Std = train/in_group_reward_std       ← 早期预警 (early warning)
+        #   ③ Gradient Norm       = train/grad_norm / grad_norm_max ← 由 rl_algo.train_step 提供
+        #   ④ Entropy Loss        = train/entropy                   ← 由 rl_algo.train_step 提供
         merged = {
             "train/raw_reward_mean": raw_reward_mean,
             "train/raw_reward_var": raw_reward_var,
-            "train/num_trajectories_before_filter": original_size,
-            "train/num_trajectories_after_filter": filtered_size,
-            "train/filter_retain_ratio": (filtered_size / max(1, original_size)),
-            "train/echo_trap_sign": int(echo_trap),
+            "train/in_group_reward_std": in_group_reward_std,
             "timing/rollout_sec": t_rollout,
             "timing/update_sec": t_update,
         }
@@ -214,21 +262,60 @@ class StarPOTrainer:
         """
         在 eval_episodes 条 episode 上跑在线推理，记录 avg_reward / success_rate / avg_length。
         验证时用固定低温采样 (尊重 agent 现有温度配置，不做修改)。
+
+        与训练侧 collect_rollouts 共用 batched 路径：每个 batch 包含 ``num_rollouts`` 个独立 env，
+        每个 env 一个独立 seed（跟训练时同 prompt 共用 seed 的语义不同，所以 seed 以 list 形式传）。
+        最后一个 batch 在 eval_episodes 不被 num_rollouts 整除时自然变小，
+        ``batched_rollout_for_prompt`` 内部按 ``len(envs)`` 跑，无需特殊处理。
         """
         logger.info(f"[StarPO step={step_idx}] evaluate on {self.eval_episodes} episodes")
         em = EvaluatorMetrics()
         eval_rewards: List[float] = []
-        for ep in range(self.eval_episodes):
-            seed = random.randint(0, 2**31 - 1)
-            traj = self._rollout_one_trajectory(seed)
-            if not traj:
-                continue
-            total_reward = float(sum(step["env_reward"] for step in traj))
-            # 严格 RAGEN 口径：terminated and not truncated；
-            # env 在 info 里显式提供 is_success/success 时以 info 为准（见 judge_success）。
-            success = judge_success(traj)
-            em.add_episode_from_trajectory(traj, success=success)
-            eval_rewards.append(total_reward)
+
+        if self._USE_BATCHED_ROLLOUT:
+            env_cfg = self.config.env_config
+            # 复用训练侧的 R 作为 eval batch size：显存足够跑 R 条 traj 的 batch generate，
+            # 评估期同样的 batch 量级即可；不需要单独引入 eval_batch_size 配置。
+            B = max(1, int(self.num_rollouts))
+            n_eval = int(self.eval_episodes)
+            for start in tqdm(range(0, n_eval, B), desc="Evaluating (batched)..."):
+                actual_b = min(B, n_eval - start)
+                seeds = [random.randint(0, 2**31 - 1) for _ in range(actual_b)]
+                envs = [make_env(env_cfg) for _ in range(actual_b)]
+                try:
+                    trajs = batched_rollout_for_prompt(
+                        envs=envs,
+                        agent=self.agent,
+                        seed=seeds,
+                        max_turn=self.max_turn,
+                        use_format_reward=self.use_format_reward,
+                        format_penalty=self.format_penalty,
+                    )
+                    for traj in trajs:
+                        if not traj:
+                            continue
+                        total_reward = float(sum(step["env_reward"] for step in traj))
+                        success = judge_success(traj)
+                        em.add_episode_from_trajectory(traj, success=success)
+                        eval_rewards.append(total_reward)
+                finally:
+                    for env in envs:
+                        try:
+                            env.close()
+                        except Exception:
+                            pass
+        else:
+            for _ in tqdm(range(self.eval_episodes), desc="Evaluating..."):
+                seed = random.randint(0, 2**31 - 1)
+                traj = self._rollout_one_trajectory(seed)
+                if not traj:
+                    continue
+                total_reward = float(sum(step["env_reward"] for step in traj))
+                # 严格 RAGEN 口径：terminated and not truncated；
+                # env 在 info 里显式提供 is_success/success 时以 info 为准（见 judge_success）。
+                success = judge_success(traj)
+                em.add_episode_from_trajectory(traj, success=success)
+                eval_rewards.append(total_reward)
 
         summary = em.summary()
         summary["eval/reward_variance"] = compute_reward_variance(eval_rewards)

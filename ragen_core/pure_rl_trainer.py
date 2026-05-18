@@ -16,12 +16,22 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from .rollout_utils import judge_success, rollout_one_trajectory
+from .rollout_utils import (
+    batched_rollout_for_prompt,
+    judge_success,
+    rollout_one_trajectory,
+)
+from envs import make_env
 from .trajectory_buffer import TrajectoryBuffer
 from configs.constants import CKPT_DIR
 from utils.logger import logger
 from utils.tracker import TrainingTracker
-from evaluation.metrics import EvaluatorMetrics, compute_reward_variance
+from evaluation.metrics import (
+    EvaluatorMetrics,
+    compute_reward_variance,
+    compute_in_group_reward_std,
+)
+from tqdm import tqdm
 
 
 class PureRLTrainer:
@@ -74,7 +84,41 @@ class PureRLTrainer:
             format_penalty=0.0,
         )
 
+    # 与 StarPOTrainer 对齐：默认走 batched rollout，详细语义见
+    # batched_rollout_for_prompt docstring。出意外时一行切回 False 即可。
+    _USE_BATCHED_ROLLOUT: bool = True
+
     def collect_rollouts(self, prompt_states: List[Dict[str, Any]]) -> None:
+        if self._USE_BATCHED_ROLLOUT:
+            self._collect_rollouts_batched(prompt_states)
+        else:
+            self._collect_rollouts_sequential(prompt_states)
+
+    def _collect_rollouts_batched(self, prompt_states: List[Dict[str, Any]]) -> None:
+        env_cfg = self.config.env_config
+        for state_info in prompt_states:
+            seed = state_info.get("seed") if isinstance(state_info, dict) else None
+            envs = [make_env(env_cfg) for _ in range(self.num_rollouts)]
+            try:
+                trajs = batched_rollout_for_prompt(
+                    envs=envs,
+                    agent=self.agent,
+                    seed=seed,
+                    max_turn=self.max_turn,
+                    use_format_reward=False,  # PureRL baseline: 不加格式惩罚
+                    format_penalty=0.0,
+                )
+                for traj in trajs:
+                    if len(traj) > 0:
+                        self.buffer.add_trajectory(traj)
+            finally:
+                for env in envs:
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
+
+    def _collect_rollouts_sequential(self, prompt_states: List[Dict[str, Any]]) -> None:
         for state_info in prompt_states:
             seed = state_info.get("seed") if isinstance(state_info, dict) else None
             for _ in range(self.num_rollouts):
@@ -89,12 +133,14 @@ class PureRLTrainer:
         self.collect_rollouts(prompt_states)
         t_rollout = time.time() - t0
 
+        # 与 StarPOTrainer 保持完全一致的指标 schema（便于事后画图对比 PureRL vs StarPO）：
+        #   raw_reward_mean       对齐论文 Figure 6 ① Average Reward
+        #   in_group_reward_std   对齐论文 Figure 6 ② In-Group Reward Std
+        #   raw_reward_var        cross-prompt 全体方差（supplemental）
         raw_returns = self.buffer.compute_returns()
         raw_reward_mean = float(np.mean(raw_returns)) if raw_returns else 0.0
         raw_reward_var = float(np.var(raw_returns)) if raw_returns else 0.0
-
-        # 不做过滤
-        n_traj = len(self.buffer.trajectories)
+        in_group_reward_std = compute_in_group_reward_std(raw_returns, self.num_rollouts)
 
         metrics: Dict[str, Any] = {}
         batch_data = self.buffer.get_all_data()
@@ -109,7 +155,7 @@ class PureRLTrainer:
         merged = {
             "train/raw_reward_mean": raw_reward_mean,
             "train/raw_reward_var": raw_reward_var,
-            "train/num_trajectories": n_traj,
+            "train/in_group_reward_std": in_group_reward_std,
             "timing/rollout_sec": t_rollout,
             "timing/update_sec": t_update,
         }
@@ -121,18 +167,54 @@ class PureRLTrainer:
         return merged
 
     def evaluate(self, step_idx: int) -> Dict[str, float]:
+        """与 StarPOTrainer.evaluate 同源 batched 路径：N 个独立 env + N 个独立 seed 一次性 batch。
+        最后一个 batch 在 eval_episodes 不被 num_rollouts 整除时自然变小。"""
         logger.info(f"[PureRL step={step_idx}] evaluate on {self.eval_episodes} episodes")
         em = EvaluatorMetrics()
         eval_rewards: List[float] = []
-        for _ in range(self.eval_episodes):
-            seed = random.randint(0, 2**31 - 1)
-            traj = self._rollout_one_trajectory(seed)
-            if not traj:
-                continue
-            total_reward = float(sum(step["env_reward"] for step in traj))
-            success = judge_success(traj)
-            em.add_episode_from_trajectory(traj, success=success)
-            eval_rewards.append(total_reward)
+
+        if self._USE_BATCHED_ROLLOUT:
+            env_cfg = self.config.env_config
+            B = max(1, int(self.num_rollouts))
+            n_eval = int(self.eval_episodes)
+            for start in tqdm(range(0, n_eval, B), desc="Evaluating (batched)..."):
+                actual_b = min(B, n_eval - start)
+                seeds = [random.randint(0, 2**31 - 1) for _ in range(actual_b)]
+                envs = [make_env(env_cfg) for _ in range(actual_b)]
+                try:
+                    trajs = batched_rollout_for_prompt(
+                        envs=envs,
+                        agent=self.agent,
+                        seed=seeds,
+                        max_turn=self.max_turn,
+                        # PureRL baseline：评估同样不叠 format penalty，跟训练侧保持一致。
+                        use_format_reward=False,
+                        format_penalty=0.0,
+                    )
+                    for traj in trajs:
+                        if not traj:
+                            continue
+                        total_reward = float(sum(step["env_reward"] for step in traj))
+                        success = judge_success(traj)
+                        em.add_episode_from_trajectory(traj, success=success)
+                        eval_rewards.append(total_reward)
+                finally:
+                    for env in envs:
+                        try:
+                            env.close()
+                        except Exception:
+                            pass
+        else:
+            for _ in range(self.eval_episodes):
+                seed = random.randint(0, 2**31 - 1)
+                traj = self._rollout_one_trajectory(seed)
+                if not traj:
+                    continue
+                total_reward = float(sum(step["env_reward"] for step in traj))
+                success = judge_success(traj)
+                em.add_episode_from_trajectory(traj, success=success)
+                eval_rewards.append(total_reward)
+
         summary = em.summary()
         summary["eval/reward_variance"] = compute_reward_variance(eval_rewards)
         return summary

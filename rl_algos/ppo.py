@@ -42,7 +42,8 @@ class PPO(BaseRLAlgo):
         super().__init__(config, agent)
 
         # ---------- 超参（直接属性访问，缺失立即 AttributeError；默认值仅来自 scripts/train.py） ----------
-        self.lr = config.learning_rate
+        self.lr = config.learning_rate                     # actor lr（论文 0.5B baseline = 1e-6）
+        self.critic_lr = config.critic_learning_rate       # critic lr（论文 0.5B baseline = 1e-5）
         self.gamma = config.gamma
         self.lam = config.lam
         self.bi_level_gae = config.bi_level_gae
@@ -114,17 +115,25 @@ class PPO(BaseRLAlgo):
         hidden_size = self.actor.config.hidden_size
         self.critic = nn.Linear(hidden_size, 1, dtype=self.actor.dtype).to(self.device)
 
+        # 论文 0.5B baseline：actor lr=1e-6 / critic lr=1e-5（两个独立 optimizer）。
+        # 我们把 critic 实现为共享 backbone 的 value head，无法物理拆开两个 optimizer，
+        # 但 PyTorch 的 param_groups 机制可以为不同参数集合设独立 lr——下面是等价做法：
+        # actor.parameters() 一组、critic.parameters() 一组，各自的 "lr" 互不影响。
         self.optimizer = build_optimizer(
             name=self.optimizer_name,
-            params=list(self.actor.parameters()) + list(self.critic.parameters()),
-            lr=self.lr,
+            params=[
+                {"params": list(self.actor.parameters()), "lr": self.lr},
+                {"params": list(self.critic.parameters()), "lr": self.critic_lr},
+            ],
+            lr=self.lr,  # fallback；正常情况下不会被用到，因为两个 group 都显式写了 lr
             actor=self.actor,
         )
         logger.info(
-            f"PPO initialized | optimizer={self.optimizer_name} lr={self.lr} epochs={self.ppo_epochs} "
+            f"PPO initialized | optimizer={self.optimizer_name} actor_lr={self.lr} "
+            f"critic_lr={self.critic_lr} epochs={self.ppo_epochs} "
             f"micro_bs={self.micro_batch_size} grad_accum={self.gradient_accumulation} "
             f"(effective mini_bs={self.mini_batch_size}) "
-            f"use_ref={self.use_ref} kl_coef={self.kl_coef} "
+            f"use_ref={self.use_ref} kl_coef={self.kl_coef} vf_coef={self.vf_coef} "
             f"bi_level_gae={self.bi_level_gae} high_level_gamma={self.high_level_gamma} "
             f"gamma={self.gamma} lam={self.lam} clip={self.clip_ratio}"
         )
@@ -257,6 +266,11 @@ class PPO(BaseRLAlgo):
         stats = {
             "actor_loss": 0.0, "critic_loss": 0.0, "entropy": 0.0, "kl_penalty": 0.0,
             "approx_kl": 0.0, "clip_frac": 0.0, "n_updates": 0,
+            # ---- Gradient norm 相关（对齐 RAGEN paper Figure 6 ③ Gradient Norm）----
+            # grad_norm:     按 optimizer step 取均值（趋势线，对应论文 EMA-smoothed 曲线）
+            # grad_norm_max: 本次 train_step 内所有 optimizer step 的 max（spike detection 用）
+            # n_grad_steps:  本次 train_step 实际触发 optimizer.step 的次数（用于求均值）
+            "grad_norm": 0.0, "grad_norm_max": 0.0, "n_grad_steps": 0,
         }
 
         logger.info(
@@ -333,11 +347,18 @@ class PPO(BaseRLAlgo):
                 accum_counter += 1
                 is_last_micro = (i + self.micro_batch_size >= len(data))
                 if (accum_counter % self.gradient_accumulation == 0) or is_last_micro:
-                    torch.nn.utils.clip_grad_norm_(
+                    # clip_grad_norm_ 的返回值是**裁剪前**的 ℓ2 total norm，
+                    # 这正好是论文 Figure 6 ③ "Gradient Norm" 想要的量（spike detection
+                    # 必须看 pre-clip，否则 clip 会把所有 spike 都压成 max_norm=1.0 看不出来）。
+                    raw_total_norm = torch.nn.utils.clip_grad_norm_(
                         list(self.actor.parameters()) + list(self.critic.parameters()), 1.0
                     )
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    gn = float(raw_total_norm)
+                    stats["grad_norm"] += gn
+                    stats["grad_norm_max"] = max(stats["grad_norm_max"], gn)
+                    stats["n_grad_steps"] += 1
 
                 # ---- 统计（off-graph） ----
                 with torch.no_grad():
@@ -366,6 +387,9 @@ class PPO(BaseRLAlgo):
         n = max(1, stats["n_updates"])
         for k in ["actor_loss", "critic_loss", "entropy", "kl_penalty", "approx_kl", "clip_frac"]:
             stats[k] = stats[k] / n
+        # grad_norm 用 optimizer.step 实际触发次数取均值（不是 micro_batch 数）
+        n_g = max(1, stats["n_grad_steps"])
+        stats["grad_norm"] = stats["grad_norm"] / n_g
 
         # ⚠️ 必须切回 eval 模式：train_step 结束后 trainer 会进入下一轮 rollout（model.generate）。
         # 如果留在 train 模式，Qwen2 forward 内部 `if self.gradient_checkpointing and self.training:`

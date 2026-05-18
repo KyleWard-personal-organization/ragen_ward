@@ -15,22 +15,21 @@ from .base_env import BaseEnv
 
 
 class BanditEnv(BaseEnv):
+    """
+    路径 A 论文对齐：Bandit 环境的特殊性 ——
+    - **arm 名字每个 episode 都不同**（动态生成），所以无法做 class-level 的 action_lookup。
+    - 论文 ``config/envs.yaml::Bandit`` 把 ``env_instruction`` 设成 ``""``：
+      具体的 prompt（包含 arm 名字）由 ``reset()`` 返回的 obs 直接给出，跟着第一轮
+      user message 进 prompt，跟 system 解耦。
+    我们这里完全照搬该约定。
+    """
 
-    agent_system_prompt = (
-        "You are a symbolic-reasoning agent facing a two-armed bandit. Each episode you "
-        "see two arms with semantically meaningful English names (e.g. 'Safe&Steady' vs. "
-        "'HighRisk&HighReward') — these names are the **only** clue about their reward "
-        "distributions. Infer the payoff shape from language: words like 'Safe', "
-        "'Steady' suggest low-variance small reward; words like 'Risk', 'HighReward' "
-        "suggest a low-probability jackpot with high variance. This is a one-shot "
-        "decision: the episode ends immediately after your single pull.\n"
-        "Output format is strict and non-negotiable: first weigh the two names inside "
-        "<think>...</think>, then output EXACTLY one arm name (verbatim, including the "
-        "'&' and capitalization) inside <answer>...</answer>.\n"
-        "Example: <think>'HighRisk&HighReward' hints at an occasional jackpot that could "
-        "still outweigh the small steady payoff of 'Safe&Steady' in expectation.</think>"
-        "<answer>HighRisk&HighReward</answer>"
-    )
+    # ---- 路径 A：论文风格 prompt 五件套 ----
+    env_instruction = ""  # 论文一致：Bandit 不在 system 里说任务，全在 reset obs 里说
+    grid_vocab = None     # 文本 obs，无网格符号
+    action_lookup = None  # arm 名字动态生成，无法 class-level 列出
+    max_actions_per_traj = 1
+    max_response_tokens = 100
 
     def __init__(self, config: Any):
         super().__init__(config)
@@ -102,21 +101,3 @@ class BanditEnv(BaseEnv):
 
     def render(self) -> Any:
         return "Bandit Env - Text Based"
-
-    def get_valid_actions(self) -> str:
-        return (
-            f"Based on the symbolic meaning, which arm do you think gives higher "
-            f"expected rewards? Output <answer>{self.name_a}</answer> or "
-            f"<answer>{self.name_b}</answer>."
-        )
-
-    def get_env_instruction(self) -> str:
-        return (
-            "You are facing a symbolic-two-armed-bandit problem. Use the **names** of "
-            "the arms as the only clue about their reward distributions — reason about "
-            "what the names imply before choosing. This is a one-shot decision: output "
-            "exactly one arm inside <answer>...</answer>.\n"
-            "Example: <think>'HighRisk&HighReward' hints at a low-probability jackpot, "
-            "'Safe&Steady' hints at a steady small payoff.</think>"
-            "<answer>Safe&Steady</answer>"
-        )

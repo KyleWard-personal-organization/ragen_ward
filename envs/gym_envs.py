@@ -102,9 +102,6 @@ class GymEnvWrapper(BaseEnv):
         except (ValueError, TypeError):
             return None
 
-    def get_valid_actions(self) -> str:
-        raise NotImplementedError
-
 
 # ---------------------------------------------------------------------------
 # 共享工具：把 `<answer>A || B || C</answer>` 切成 ["A", "B", "C"]
@@ -134,21 +131,21 @@ def _split_action_tokens(action_text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 class CartPoleEnv(GymEnvWrapper):
-    """CartPole 封装。连续平衡任务 → 仅单动作语义，不支持 `||` 序列。"""
+    """CartPole 封装。连续平衡任务 → 仅单动作语义，不支持 `||` 序列。
 
-    agent_system_prompt = (
-        "You are a control agent playing CartPole. Your only goal is to keep the pole "
-        "balanced upright by pushing the cart left or right. At each turn you observe "
-        "four numbers: cart position, cart velocity, pole angle, pole angular velocity. "
-        "The episode ends (failure) if the pole falls past ~±0.21 rad or the cart leaves "
-        "the ~±2.4 track. A common heuristic: push in the direction the pole is leaning "
-        "toward, weighted by the pole's angular velocity.\n"
-        "Output format is strict and non-negotiable: first reason inside "
-        "<think>...</think>, then output exactly ONE action (0 = left, 1 = right) inside "
-        "<answer>...</answer>. Any deviation from this format is treated as an invalid turn.\n"
-        "Example: <think>Pole angle is +0.05 and still increasing, push right to counter."
-        "</think><answer>1</answer>"
+    路径 A 论文对齐：无 grid_vocab（连续 obs）；action_lookup 用论文风格短表；
+    env_instruction 一句话，不泄露平衡策略。
+    """
+
+    # ---- 路径 A：论文风格 prompt 五件套 ----
+    env_instruction = (
+        "You are controlling a CartPole. Push the cart left or right to keep the pole "
+        "balanced upright as long as possible. Each turn you output exactly one action."
     )
+    grid_vocab = None  # 连续 obs，无网格符号
+    action_lookup = {0: "Push cart left (0)", 1: "Push cart right (1)"}
+    max_actions_per_traj = 1  # CartPole 不支持 ||
+    max_response_tokens = 100
 
     def __init__(self, config: Any):
         config.env_name = 'CartPole-v1'
@@ -178,17 +175,6 @@ class CartPoleEnv(GymEnvWrapper):
             f"Pole Angle: {pole_angle:.4f}, Pole Velocity at Tip: {pole_vel:.4f}"
         )
 
-    def get_valid_actions(self) -> str:
-        return "Valid actions are: 0 (Push cart to the left), 1 (Push cart to the right)."
-
-    def get_env_instruction(self) -> str:
-        return (
-            "You are controlling a CartPole to keep the pole balanced. "
-            "Each turn you output **one** action. "
-            "Wrap the action number inside <answer>...</answer>. "
-            "Example: <think>The pole is tilting right, push right.</think><answer>1</answer>"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Sokoban：RAGEN 主力多步规划环境
@@ -199,22 +185,27 @@ class SokobanEnv(GymEnvWrapper):
     Sokoban (推箱子) 环境封装。RAGEN 中的多步空间推理测试床。
 
     对齐 RAGEN 论文的 `||` 动作序列：一次回复可以一次性规划多步推箱子。
+
+    路径 A 论文对齐：env_instruction 直接复用论文 ``config/envs.yaml::SimpleSokoban``
+    的字面文本（一句话级别，不含 heuristic、不泄露 reward）；grid_vocab 和
+    action_lookup 与论文 SokobanEnvConfig 字段一致，自动拼到 system 里。
     """
 
-    agent_system_prompt = (
-        "You are a spatial planning agent solving Sokoban. The grid uses: "
-        "`#`=wall, `_`=empty floor, `O`=target, `X`=box, `√`=box already on a target, "
-        "`P`=player, `S`=player standing on a target. Your goal is to push every X onto "
-        "an O so it becomes √. You can only **push** boxes (by walking into them with "
-        "free space on the other side); you cannot pull, and a box shoved into a wall "
-        "corner is often unrecoverable, so plan several moves ahead.\n"
-        "Output format is strict and non-negotiable: first reason inside "
-        "<think>...</think>, then output the action sequence inside <answer>...</answer>. "
-        "Use Up/Down/Left/Right (or 1/2/3/4) separated by `||` to execute multiple moves "
-        "in a single turn — this is strongly encouraged for efficiency.\n"
-        "Example: <think>Box at (2,3), target at (2,5). I need to approach from the left "
-        "and push right twice.</think><answer>Right || Right || Right</answer>"
+    # ---- 路径 A：论文风格 prompt 五件套（与 RAGEN config/envs.yaml::SimpleSokoban 对齐）----
+    env_instruction = (
+        "You are solving the Sokoban puzzle. You are the player and you need to push "
+        "all boxes to targets. When you are right next to a box, you can push it by "
+        "moving in the same direction. You cannot push a box through a wall, and you "
+        "cannot pull a box. The answer should be a sequence of actions, like "
+        "<answer>Right || Right || Up</answer>"
     )
+    grid_vocab = {
+        "#": "wall", "_": "empty", "O": "target", "√": "box on target",
+        "X": "box", "P": "player", "S": "player on target",
+    }
+    action_lookup = {1: "Up", 2: "Down", 3: "Left", 4: "Right"}
+    max_actions_per_traj = 10  # 论文 SimpleSokoban 默认值
+    max_response_tokens = 100  # 论文 SimpleSokoban 默认值
 
     def __init__(self, config: Any):
         try:
@@ -317,25 +308,6 @@ class SokobanEnv(GymEnvWrapper):
             grid_str += "".join([self.GRID_LOOKUP.get(cell, "?") for cell in row]) + "\n"
         return grid_str.strip()
 
-    def get_valid_actions(self) -> str:
-        return (
-            "Valid actions: 1=Up, 2=Down, 3=Left, 4=Right. "
-            "You may output a sequence separated by '||'. "
-            "Example: <answer>Up || Right || Right</answer>"
-        )
-
-    def get_env_instruction(self) -> str:
-        return (
-            "You are solving Sokoban. Push every box (X) onto a target (O). "
-            "You can push a box only by walking towards it; you cannot pull or walk "
-            "through walls. When a box sits on a target it shows as √. The player is P "
-            "(S when standing on a target).\n"
-            "**Answer format**: put a sequence of moves inside <answer>...</answer>, "
-            "separated by `||`. Words (Up/Down/Left/Right) or numbers (1-4) both work.\n"
-            "Example: <think>I need to push the box right then go up.</think>"
-            "<answer>Right || Right || Up</answer>"
-        )
-
     def _parse_action_sequence(self, action_text: str) -> List[Optional[int]]:
         tokens = _split_action_tokens(action_text)
         return [self._parse_action(tok) for tok in tokens]
@@ -369,57 +341,138 @@ class FrozenLakeEnv(GymEnvWrapper):
     """
     FrozenLake 封装，对齐 RAGEN 网格化文本渲染 + `||` 多动作序列。
 
-    默认使用 4x4 地图的确定性版本（降低小模型训练难度）。
+    ## 三个相互独立的开关变量
 
-    ## Reward shaping（本地开关，不上报到 EnvConfig / CLI）
+    | 类属性                 | 含义                                                     | 论文对齐值 |
+    |------------------------|----------------------------------------------------------|-----------|
+    | ``is_slippery``        | 冰面是否打滑（True → 0.8 沿指示方向，0.1/0.1 给两侧）    | True      |
+    | ``use_shaped_reward``  | 是否叠加距离/撞墙/通关 shaping reward                    | False     |
+    | ``randomize_map``      | 每次 reset 是否重新随机生成地图（基于 seed）             | True      |
 
-    原生 FrozenLake 是"到 Goal = +1，其他一律 0"的极度稀疏奖励，对小模型 + 有限 rollout
-    量的 cold-start 极不友好（4x4 地图下 32 rollout/step 里成功样本期望 < 0.01）。把类属性
-    ``use_shaped_reward`` 切成 True 后，会在每个**非终止**原子 step 上按"曼哈顿距离变化 +
-    是否撞墙"叠一个小幅 shaping reward（量级 ±0.01 ~ ±0.05），**绝不**会盖过终点 +1 的主
-    信号；终止步（到 Goal / 掉洞）严格保持原生 reward 语义：
+    三个开关彼此完全正交，2³=8 种组合都合法：
+    - **(True, False, True)**  → **论文 100% baseline**：滑动 + 稀疏 reward + 每次 reset 一张随机图
+    - (False, False, False)    → 老的"小模型友好"baseline：确定性 + 稀疏 reward + 固定 4x4 默认图
+    - (False, True, False)     → 老的 reward shaping 实验
+    - (True, True, True)       → 论文式滑动随机图 + dense reward（合法但 shaping 信号会被稀释）
+    - 其他 4 组合同理。
 
-    - 到 Goal：reward=+1.0，不叠 shaping，保留完整主信号
-    - 掉洞：  reward=0.0，不叠 shaping（不惩罚，避免模型学成"害怕探索"）
-    - 其他：  reward=原生 0.0 + shaping（见下方常量）
+    ## randomize_map 实现细节
 
-    切换模式只需改 ``use_shaped_reward`` 一行，不用动 CLI / EnvConfig / 训练脚本。想跑 RAGEN
-    论文对齐的 sparse baseline，把它改成 False 重训即可。
+    `randomize_map=False`（默认）→ 始终用 gymnasium 自带的固定 4x4 地图（``MAPS["4x4"]``
+    = SFFF/FHFH/FFFH/HFFG），跟之前一样。
+
+    `randomize_map=True` → 每次 ``reset(seed=X)`` 时：
+    1. 调 gymnasium 自带的 ``generate_random_map(size=4, p=0.9, seed=X)`` 生成新地图
+       （p=0.9 = 论文值：每格 90% 概率 frozen，10% 概率 hole；保证有一条 S→G 通路）
+    2. 重建底层 ``self.env``（gymnasium 0.28.x 的 P 表是 ``__init__`` 时算的，desc 改了
+       必须重建才能让 ``categorical_sample`` 用上新地图）
+    3. 重新缓存 Goal 位置（用于 shaping）
+
+    这跟 RAGEN ``ragen/env/frozen_lake/env.py::reset`` 的 ``self.__init__(self.config)``
+    重建路径数学等价。
+
+    ## is_slippery=True 的实现细节
+
+    gymnasium 0.28.x 的 FrozenLake-v1 不支持 ``success_rate`` 参数（gymnasium 1.x
+    才加进去），所以我们**始终把底层 gym env 跑成 deterministic** (``is_slippery=False``
+    传给 gymnasium)，然后在 ``_step_atomic`` 里**自己根据 ``slippery_success_rate``
+    重采样真实执行的 action**：
+
+        若 self.is_slippery == True:
+            真实 action = a            with prob = 0.8   ← slippery_success_rate
+                        = (a - 1) % 4  with prob = 0.1   ← 沿轴左转 90°
+                        = (a + 1) % 4  with prob = 0.1   ← 沿轴右转 90°
+
+    这跟论文 ``GymFrozenLakeEnv(success_rate=0.8)`` 数学完全等价（gymnasium 1.x
+    源码里写的就是 fail_rate = (1 - success_rate) / 2 给 perpendicular 两侧均分）。
+    随机源直接复用 gymnasium env 自己的 ``np_random``，所以 ``reset(seed=...)``
+    依然能完整复现整条轨迹。
+
+    ## Reward shaping（``use_shaped_reward=True`` 时）
+
+    原生 FrozenLake 是"到 Goal = +1，其他一律 0"的极度稀疏奖励，对小模型 +
+    有限 rollout 量的 cold-start 不友好。开 shaping 后，每个**非终止**原子 step
+    按"曼哈顿距离变化 + 是否撞墙"叠一个小幅 shaping reward；真正**到达目标**
+    的终止步追加一个较大的 ``_SUCCESS_BONUS`` 以主导总 return，防止 policy 通过
+    "多撞墙/多来回走"这类 proxy-hack 把 shaping 刷成比通关还高的 return。
+
+    - 到 Goal：reward = +1.0（gym 原生） + ``_SUCCESS_BONUS``
+    - 掉洞：  reward = 0.0，不叠 shaping（不惩罚，避免模型学成"害怕探索"）
+    - 其他：  reward = 原生 0.0 + shaping（见下方常量）
+
+    注意：shaping 用的是 ``prev_s`` vs ``curr_s`` 的真实位置变化，跟"被滑动改变
+    了真实执行 action"无关 —— 即使 ``is_slippery=True`` 也能正常工作，只是
+    shaping 信号会被打滑稀释（同样的 action 时而正向 closer 时而 waste）。
     """
 
-    agent_system_prompt = (
-        "You are a spatial reasoning agent playing FrozenLake on a 4x4 grid. The grid uses: "
-        "`P`=you (the player), `_`=safe ice, `O`=hole (stepping in = episode ends with "
-        "reward 0), `G`=goal (stepping in = episode ends with reward 1), `X`=you fell into "
-        "a hole, `√`=you reached the goal. Coordinates grow **down** (row) and **right** "
-        "(column); the goal is at the bottom-right. Each move shifts you one tile; walking "
-        "into a wall leaves you in place (wasted move).\n"
-        "Output format is strict and non-negotiable: first reason inside "
-        "<think>...</think>, then output the action sequence inside <answer>...</answer>. "
-        "Use Left/Down/Right/Up (or 1/2/3/4) separated by `||` to plan multiple moves per "
-        "turn — strongly encouraged since each turn costs an LLM call.\n"
-        "Example: <think>I'm at row 0 col 0. The goal is at row 3 col 3. Row 1 col 1 is a "
-        "hole, so I'll go right twice first then down.</think>"
-        "<answer>Right || Right || Down || Down || Down</answer>"
+    # ---- 路径 A：论文风格 prompt 五件套（与 RAGEN config/envs.yaml::FrozenLake 对齐）----
+    # env_instruction 直接复用论文字面文本：一句话任务描述 + 一个 example，
+    # 不含任何 heuristic（不告诉模型"goal 在右下角"、"撞墙是浪费"），
+    # 不含任何 reward 规则泄露（不告诉模型"到 G 给 reward 1"），
+    # 不告诉模型坐标系（让 RL 自己学）。
+    env_instruction = (
+        "You are solving the FrozenLake puzzle. Forbid the hole and go to the target. "
+        "You may move to the unintended direction due to the slippery ice. "
+        "Example answer format: To forbid the hole and go to the target, I should go "
+        "left then go up. <answer>Left || Up</answer>"
     )
+    grid_vocab = {
+        "P": "player", "_": "empty", "O": "hole", "G": "goal",
+        "X": "player in hole", "√": "player on goal",
+    }
+    action_lookup = {1: "Left", 2: "Down", 3: "Right", 4: "Up"}
+    max_actions_per_traj = 10  # 论文 FrozenLake 默认值
+    max_response_tokens = 100  # 论文 FrozenLake 默认值
 
     # gymnasium FrozenLake 的离散动作：0=Left, 1=Down, 2=Right, 3=Up
+    # 注意 (a-1)%4 / (a+1)%4 在这个编码下刚好是该动作的两个 perpendicular 方向：
+    #   Left=0  → Up=3 / Down=1
+    #   Down=1  → Left=0 / Right=2
+    #   Right=2 → Down=1 / Up=3
+    #   Up=3    → Right=2 / Left=0
+    # 这跟 gymnasium 1.x FrozenLakeEnv 源码里写的滑动逻辑完全一致。
     _WORD_TO_GYM = {"left": 0, "down": 1, "right": 2, "up": 3}
 
     # ------------------------------------------------------------------
-    # Reward shaping 本地开关 + 系数（见类 docstring）
+    # 开关 1：is_slippery —— 论文对齐 baseline 应该置 True
     # ------------------------------------------------------------------
-    # True  = 对非终止原子 step 叠加"距离 + 撞墙"的 shaping reward
-    # False = 完全透传 gymnasium 原生 reward（对齐 RAGEN 论文原始 FrozenLake 语义）
-    use_shaped_reward: bool = True
+    is_slippery: bool = True
+    slippery_success_rate: float = 0.8  # 论文 RAGEN config: success_rate=0.8
 
-    # shaping 系数。刻意设计成 |shaping| <<|goal reward| = 1.0，避免盖过终点主信号。
-    _SHAPING_CLOSER: float = 0.02    # 曼哈顿距离到 goal 减小（朝对方向走）
-    _SHAPING_FARTHER: float = -0.01  # 走完一步距离没减（反方向 / 平行）
-    _SHAPING_WASTE: float = -0.05    # 撞墙（curr_s == prev_s，动作未生效）
+    # ------------------------------------------------------------------
+    # 开关 2：use_shaped_reward —— 论文对齐 baseline 应该置 False
+    # ------------------------------------------------------------------
+    use_shaped_reward: bool = False
+
+    # ------------------------------------------------------------------
+    # 开关 3：randomize_map —— 论文对齐 baseline 应该置 True
+    # ------------------------------------------------------------------
+    # True  = 每次 reset(seed=X) 用 generate_random_map(size, p, seed=X) 重生成地图
+    # False = 始终用 gymnasium MAPS["4x4"] 固定地图（SFFF/FHFH/FFFH/HFFG）
+    randomize_map: bool = True
+    random_map_size: int = 4    # 论文 RAGEN config: size=4
+    random_map_frozen_p: float = 0.9  # 论文 RAGEN config: p=0.9 (frozen 比例)
+
+    # shaping 系数（仅在 use_shaped_reward=True 时生效）
+    _SHAPING_CLOSER: float = 0.1     # 曼哈顿距离到 goal 减小（朝对方向走）
+    _SHAPING_FARTHER: float = -0.00  # 走完一步距离没减（反方向 / 平行）
+    _SHAPING_WASTE: float = -0.30    # 撞墙（curr_s == prev_s，动作未生效）
+
+    # 真正到达 Goal 时，在 gym 原生 +1 之外再追加一次性 bonus。设计意图是压制 shaping
+    # proxy-hack：单条 rollout 即使把 _SHAPING_CLOSER 占满也只是线性累积几步 × 0.1，而
+    # 到达 goal 会一次性多拿 +2.0，拉开 return 数量级差距。
+    _SUCCESS_BONUS: float = 2.0
 
     def __init__(self, config: Any):
+        # 缓存 config，randomize_map=True 时 reset 要用它重建 self.env（拷贝一份，
+        # 避免 reset 时改 config.kwargs 影响外面持有的引用）。
+        import copy
+        self._base_config = copy.copy(config)
+
         config.env_name = 'FrozenLake-v1'
+        # 关键：始终让底层 gymnasium 跑 deterministic（is_slippery=False）。
+        # 我们的 self.is_slippery=True 时由 _step_atomic 自己重采样 action 实现滑动，
+        # 完全绕开 gymnasium 0.28.x 不支持 success_rate 参数的限制。
         config.kwargs = {"is_slippery": False, "map_name": "4x4"}
         super().__init__(config)
 
@@ -428,11 +481,72 @@ class FrozenLakeEnv(GymEnvWrapper):
 
         # 从 desc 里查 Goal 位置（默认 4x4 地图 = (3,3)，不硬编码以兼容自定义地图 / 8x8）。
         # 仅在 `__init__` 查一次并缓存，避免 _step_atomic 里每步都扫描 desc。
+        # randomize_map=True 时每次 reset 还会重新缓存（地图变了 Goal 位置可能也变）。
+        self._refresh_goal_cache()
+
+    def _refresh_goal_cache(self) -> None:
+        """从当前 self.env.unwrapped.desc 提取 Goal 位置并缓存到 self._goal_row/col。
+        randomize_map=True 时每次 reset 调一次（地图换了 Goal 位置可能换了）。"""
         import numpy as np
         goal_positions = np.argwhere(self.env.unwrapped.desc == b'G')
         assert len(goal_positions) > 0, "FrozenLake map has no Goal cell"
         self._goal_row: int = int(goal_positions[0][0])
         self._goal_col: int = int(goal_positions[0][1])
+
+    def reset(self, seed: Optional[int] = None, **kwargs) -> Tuple[str, dict]:
+        """
+        randomize_map=False（默认）→ 走 GymEnvWrapper.reset 原路径（同一张固定 4x4 图）。
+
+        randomize_map=True → 用 ``generate_random_map(size, p, seed=seed)`` 生成新地图，
+        重建 self.env，再走标准 reset 流程。这跟 RAGEN 论文 ``self.__init__(self.config)``
+        重建路径数学等价（但只在地图层面重建，class attribute 不会被重置）。
+        """
+        if self.randomize_map:
+            from gymnasium.envs.toy_text.frozen_lake import generate_random_map
+
+            # generate_random_map 内部用 numpy seeded RNG，确保 (size, p, seed) 完全
+            # 决定地图布局 → 同 seed reset 产出同一张图，复现性 OK。
+            new_desc = generate_random_map(
+                size=int(self.random_map_size),
+                p=float(self.random_map_frozen_p),
+                seed=seed,
+            )
+
+            # 旧 env 显式关掉避免 Windows 上的 pygame 资源泄漏，再用 desc=... 重建。
+            try:
+                self.env.close()
+            except Exception:
+                pass
+            self.env = gym.make(
+                'FrozenLake-v1',
+                max_episode_steps=self.max_steps,
+                is_slippery=False,   # 我们自己处理滑动（见 _maybe_apply_slippery）
+                desc=new_desc,
+            )
+            self._refresh_goal_cache()
+
+        return super().reset(seed=seed, **kwargs)
+
+    def _maybe_apply_slippery(self, gym_action: int) -> Tuple[int, bool]:
+        """
+        若 ``self.is_slippery=True``，按 0.8 / 0.1 / 0.1 重采样真实执行的 gym action。
+        否则原样返回。返回 (executed_action, was_slipped)。was_slipped 仅供 info 调试。
+
+        随机源使用 ``self.env.unwrapped.np_random``（gymnasium 内置），所以 ``reset(seed)``
+        会完整复现整条 trajectory（包括滑动结果）。
+        """
+        if not self.is_slippery:
+            return gym_action, False
+
+        np_random = self.env.unwrapped.np_random
+        # 0.8 沿原方向 / 0.1 沿 (a-1)%4 / 0.1 沿 (a+1)%4
+        p_main = float(self.slippery_success_rate)
+        p_side = (1.0 - p_main) / 2.0
+        candidates = [(gym_action - 1) % 4, gym_action, (gym_action + 1) % 4]
+        probs = [p_side, p_main, p_side]
+        idx = int(np_random.choice(3, p=probs))
+        executed = candidates[idx]
+        return executed, bool(executed != gym_action)
 
     def _step_atomic(self, gym_action: Optional[int]) -> Tuple[str, float, bool, bool, dict]:
         # FrozenLake 的"成功"语义：踩到 Goal（唯一能给出 reward=1.0 的终止情形）。
@@ -441,24 +555,46 @@ class FrozenLakeEnv(GymEnvWrapper):
         # 的格子索引（self.env.unwrapped.s）——step 前后位置不变即"撞墙/出界"，即
         # 动作未生效。
         prev_s = int(self.env.unwrapped.s) if gym_action is not None else None
-        obs, reward, terminated, truncated, info = super()._step_atomic(gym_action)
+
+        # is_slippery=True 时，截获 agent 给的 action，按论文 0.8/0.1/0.1 重采样真实执行的
+        # action；is_slippery=False 时原样透传。底层 gymnasium 永远是 deterministic 的，
+        # 滑动语义完全由我们这一层实现 —— 跟论文 success_rate=0.8 数学等价。
+        executed_action = gym_action
+        was_slipped = False
+        if gym_action is not None:
+            executed_action, was_slipped = self._maybe_apply_slippery(gym_action)
+
+        obs, reward, terminated, truncated, info = super()._step_atomic(executed_action)
         if gym_action is None:
             return obs, reward, terminated, truncated, info
+
+        # 把"agent 想做什么 / 实际执行了什么"都记到 info 里供事后分析（不影响 reward）。
+        info["agent_action"] = int(gym_action)
+        info["executed_action"] = int(executed_action)
+        info["was_slipped"] = was_slipped
 
         if bool(terminated):
             info["is_success"] = bool(float(reward) >= 1.0 - 1e-6)
         else:
             info["is_success"] = False
 
+        # action_is_effective 看真实位置变化（是否离开 prev_s），跟"是 agent 自己输出
+        # 的方向" 还是 "被滑出来的方向" 无关 —— 这正是论文 RAGEN 评估时的语义：只要
+        # 动作让 agent 真的动了，就算 effective。
         curr_s = int(self.env.unwrapped.s)
         action_effective = bool(curr_s != prev_s)
         info["action_is_effective"] = action_effective
 
-        # Reward shaping（仅在非终止步上叠加；终止步保持原生 reward 语义，详见类 docstring）。
-        if self.use_shaped_reward and not terminated:
-            shaping = self._compute_shaping_reward(prev_s, curr_s, action_effective)
-            reward = float(reward) + shaping
-            info["reward_shaping"] = shaping
+        # Reward shaping：非终止步叠加距离/撞墙 shaping；终止且成功时追加 _SUCCESS_BONUS；
+        # 终止但失败（掉洞）保持原生 0.0（不惩罚，避免"害怕探索"）。详见类 docstring。
+        if self.use_shaped_reward:
+            if not terminated:
+                shaping = self._compute_shaping_reward(prev_s, curr_s, action_effective)
+                reward = float(reward) + shaping
+                info["reward_shaping"] = shaping
+            elif info.get("is_success", False):
+                reward = float(reward) + self._SUCCESS_BONUS
+                info["reward_shaping"] = self._SUCCESS_BONUS
 
         return obs, float(reward), terminated, truncated, info
 
@@ -503,24 +639,6 @@ class FrozenLakeEnv(GymEnvWrapper):
 
         grid_str = '\n'.join(''.join(self.GRID_LOOKUP.get(cell, "?") for cell in row) for row in room)
         return grid_str
-
-    def get_valid_actions(self) -> str:
-        return (
-            "Valid actions: 1=Left, 2=Down, 3=Right, 4=Up. "
-            "You may output a sequence separated by '||'. "
-            "Example: <answer>Right || Right || Down</answer>"
-        )
-
-    def get_env_instruction(self) -> str:
-        return (
-            "You are solving FrozenLake. Navigate from the player (P) to the goal (G) "
-            "while avoiding holes (O). Each move shifts the player by exactly one tile "
-            "in the chosen direction; moving into a wall leaves the player in place.\n"
-            "**Answer format**: put a sequence of moves inside <answer>...</answer>, "
-            "separated by `||`. Words (Left/Down/Right/Up) or numbers (1-4) both work.\n"
-            "Example: <think>The goal is to the lower right. I'll head right then down.</think>"
-            "<answer>Right || Right || Down || Down</answer>"
-        )
 
     def _parse_action_sequence(self, action_text: str) -> List[Optional[int]]:
         tokens = _split_action_tokens(action_text)
