@@ -1,0 +1,70 @@
+\section{Method and System Design}
+\label{sec:system}
+
+\subsection{Modular Rewrite}
+
+The codebase is organized around five modules with explicit contracts:
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Module & Responsibility \\
+\midrule
+\code{envs} & Multi-turn environment reset, transition, reward, and action parsing. \\
+\code{agents} & LLM loading, single-request generation, and batched generation. \\
+\code{rl\_algos} & PPO and GRPO losses, advantage computation, and optimizer updates. \\
+\code{ragen\_core} & Rollout collection, variance filtering, batching, and iteration-level scheduling. \\
+\code{evaluation} & Episode-level evaluation metrics and aggregation. \\
+\bottomrule
+\end{tabularx}
+\caption{Five-module design of \method.}
+\label{tab:modules}
+\end{table}
+
+This design makes the six-run experiment matrix a configuration-level controlled comparison. The PPO and GRPO runs share the same environment, agent interface, rollout machinery, logging system, evaluation code, and seed. They differ mainly in \code{rl\_algos/ppo.py} versus \code{rl\_algos/grpo.py}, plus the presence or absence of the critic.
+
+\subsection{Algorithm Implementation Details}
+
+The PPO implementation uses actor-critic parameter groups so that the actor and critic learning rates match the RAGEN baseline. PPO and GRPO both use KL regularization with a frozen reference policy. The format penalty is injected at the turn where the malformed response occurs, rather than being applied once at the end of a trajectory. This keeps the credit-assignment signal local to the failure.
+
+For diagnostics, the implementation records the pre-clipping global gradient norm returned by \code{clip\_grad\_norm\_}. Reporting the post-clipping value would hide gradient spikes because it is always bounded by \code{max\_grad\_norm=1.0}. This detail matters when comparing collapse behavior to RAGEN's gradient-norm diagnostics.
+
+\subsection{Memory Optimization Stack}
+
+The memory layer is designed around one constraint: a 0.5B model, a critic, and a reference policy must all fit into 8 GB VRAM during multi-turn RL.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\# & Optimization & Effect and mathematical status \\
+\midrule
+A & AdamW8bit & Saves roughly 3 GB of optimizer-state memory, but introduces block-wise quantization noise. \\
+B & 32-bit embedding states & Keeps embedding optimizer states in fp32 to prevent NaNs; no memory saving, but improves stability. \\
+C & Gradient checkpointing & Saves roughly 1 GB of activation memory at the cost of extra recomputation; mathematically equivalent. \\
+D & KV-cache restoration & Re-enables generation cache after checkpointing disables it globally; improves rollout speed by roughly \(3\times\)--\(10\times\). \\
+E & Reference no-checkpointing & Disables checkpointing for the frozen reference model, whose forward passes run under no-gradient mode. \\
+F & Micro-batch 1, accumulation 32 & Preserves effective mini-batch size 32; mathematically equivalent to larger micro-batches but slower. \\
+G & bf16 weights & Saves model-weight memory relative to fp32 and avoids fp16 range issues. \\
+H & Max sequence length & Code default is 2048; later memory-pressure runs override to 1536, truncating only rare long trajectories. \\
+I & Expandable allocator and cache clearing & Reduces effective fragmentation in Windows WDDM edge cases. \\
+\bottomrule
+\end{tabularx}
+\caption{Memory and stability optimizations used to make training feasible on an 8 GB GPU.}
+\label{tab:memory}
+\end{table*}
+
+The most subtle fix is KV-cache restoration. In HuggingFace Transformers, enabling gradient checkpointing sets \code{config.use\_cache=False}. That is appropriate for training forward passes, but it also slows autoregressive rollout generation if left unchanged. \method{} explicitly restores \code{use\_cache=True} for generation and passes \code{use\_cache=False} only in training forwards. It also switches the actor into evaluation mode between updates so the checkpointing path does not silently disable cache during rollout.
+
+\subsection{Throughput Optimization Stack}
+
+Because vLLM is not available in the Windows setup used for the experiments, rollout throughput is improved in native PyTorch. The agent layer implements \code{batched\_chat\_request}: prompts are left-padded, attention masks isolate padding positions, and a single \code{generate} call produces multiple completions. The rollout core then advances a batch of trajectories turn by turn. After each environment step, completed trajectories are removed from the next generation batch. This alive-only shrinking avoids wasting GPU time on trajectories that have already terminated.
+
+The combination of batched generation and alive-only shrinking gives a practical \(3\times\)--\(5\times\) rollout improvement over naive serial generation while preserving the same per-sequence sampling distribution.
+
+\subsection{Data and Logging Infrastructure}
+
+Each training step and evaluation point writes metrics to console output, \code{logs/<exp\_name>\_metrics.jsonl}, and a full text log. The figures in this report are generated from those logs. This makes the report data path reproducible: the analysis does not rely on hand-edited measurements beyond the plotting and table aggregation scripts.

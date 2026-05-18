@@ -8,7 +8,7 @@
 
 本研究以 RAGEN (Wang et al., 2025) 为参照，在单张 NVIDIA RTX 4070（8GB VRAM）的消费级硬件 + 纯 Windows 软件栈下，系统性复现了多轮交互冰湖（FrozenLake）环境上的 LLM Agent 强化学习训练流程。研究产出两条互相佐证的贡献：
 
-- **工程贡献（C1）**：将原 RAGEN 仓库严格解耦为 5 个可插拔模块（`envs / agents / rl_algos / ragen_core / evaluation`），并构建了一套面向 8GB VRAM 的硬件优化栈（涵盖 8-bit Adam 量化、梯度检查点 + KV cache 修复、reference 模型禁检查点、batched rollout 协议、alive-only 批次收缩等共 9 层优化），相比论文 fp32 baseline 节省 6–8 GB 显存，让 0.5B 模型能在 8GB 卡上完成完整 200 步训练。
+- **工程贡献（C1）**：将原 RAGEN 仓库严格解耦为 5 个可插拔模块（`envs / agents / rl_algos / ragen_core / evaluation`），并构建了一套面向 8GB VRAM 的硬件优化栈（涵盖 8-bit Adam 量化、梯度检查点 + KV cache 修复、reference 模型禁检查点、batched rollout 协议、alive-only 批次收缩等显存与吞吐优化），相比论文 fp32 baseline 节省 6–8 GB 显存，让 0.5B 模型能在 8GB 卡上完成完整 200 步训练。
 - **研究贡献（C2）**：在 PPO × GRPO × `variance_filter_ratio` ∈ {1.0, 0.5, 0.25} 的 6 组完整实验矩阵上，方向性复现了论文关于 vanilla 不稳定性、StarPO-S 修复、filter trade-off 三大论点（PPO 维度），同时发现一组**反向复现**——GRPO 三组的所有论点完全反向：vanilla GRPO 是 6 组里唯一接近论文 0.5B baseline 水平的实验（success_rate=22.5% / format_compliance=80.8% / final reward=+0.225），而 variance filter 越激进性能越差。本研究通过三层机制根因分析（critic 数据增强 / z-score 不变性 / PPO-Clip 退化共享）揭示了 variance-based rollout filter 是为 PPO with critic 设计的稳定化机制，**不直接迁移到 actor-only 的 GRPO 上**——这是论文未明确讨论的算法适用性边界。
 
 ---
@@ -57,7 +57,7 @@ RAGEN 论文的实验在多卡服务器（A100 / H100 级别）上完成，使�
 
 把原 RAGEN 仓库严格解耦为 5 个模块：环境层、agent 层、RL 算法层、训练循环层、评估层。每一层都有明确的输入输出契约，可以独立替换或扩展（例如把 PPO 替换成 GRPO 只需要切换 RL 算法层，不影响其他模块）。
 
-在此基础上，针对 8 GB VRAM 这一极端约束，构建了一套涵盖 9 个层级的硬件优化栈，相比论文 fp32 baseline 节省 6–8 GB VRAM 峰值。其中两项最值得强调的工程亮点是：
+在此基础上，针对 8 GB VRAM 这一极端约束，构建了一套同时覆盖显存与 rollout 吞吐的硬件优化栈，相比论文 fp32 baseline 节省 6–8 GB VRAM 峰值。其中两项最值得强调的工程亮点是：
 
 - **KV cache 修复**：HuggingFace 在启用 `gradient_checkpointing` 时会全局把 `use_cache=False`，导致 rollout 阶段的 autoregressive decode 退化为 O(L²) 复杂度。本研究通过显式恢复 cache + train/eval 状态切换的双重修复，把 rollout 速度提升 3–10 倍。
 - **Batched rollout 协议**：在纯 PyTorch 的 Windows 环境下（无 vLLM）实现了"每 turn 凑 batch、提前 done 的 trajectory 立即退出 batch"的 alive-only 批次收缩协议，使 rollout 吞吐量提升 3–5 倍。
@@ -80,7 +80,7 @@ C2 的核心论断——variance filter 是为 PPO with critic 设计的稳定�
 本报告共 7 章 + 附录：
 
 - **第 2 章** 介绍 LLM 后训练相关工作、PPO/GRPO 算法基础与基本推导，以及 RAGEN 的核心机制（StarPO / StarPO-S / variance filter / bi-level GAE）。
-- **第 3 章** 详细展开本研究的方法与系统设计，重点是消费级硬件优化栈的 9 层结构。
+- **第 3 章** 详细展开本研究的方法与系统设计，重点是消费级硬件优化栈的多层结构。
 - **第 4 章** 给出 6 组实验的详细设置：实验矩阵、共享变量、与论文 baseline 的参数对齐表、硬件让步分级、评估指标。
 - **第 5 章** 是报告的核心，按双线叙事分别展开 PPO 三组的方向性复现（5.1）、GRPO 三组的反向复现（5.2）、量化噪声的算法 × 硬件交互证据（5.3）。
 - **第 6 章** 讨论本研究的工程与研究贡献、明确局限性、并给出按"代码已就绪"为主旋律的 future work。
@@ -130,7 +130,7 @@ $$
 \hat{A}_t^{\text{GAE}(\gamma, \lambda)} = \sum_{l=0}^{T-t} (\gamma \lambda)^l \delta_{t+l}^V
 $$
 
-参数 $\lambda \in [0, 1]$ 控制偏差-方差权衡：$\lambda = 1$ 退化为 Monte Carlo 回报（无偏但高方差），$\lambda = 0$ 退化为 TD(0)（低方差但有偏）。本研究遵循论文设置 $\lambda_{\text{token}} = 0.95, \lambda_{\text{turn}} = 1.0$。
+参数 $\lambda \in [0, 1]$ 控制偏差-方差权衡：$\lambda = 1$ 退化为 Monte Carlo 回报（无偏但高方差），$\lambda = 0$ 退化为 TD(0)（低方差但有偏）。本研究实现中使用 `lam=1.0`，并通过 `high_level_gamma=0.95` 控制 turn-level 折扣。
 
 #### 2.2.3 PPO-Clip 损失
 
@@ -173,10 +173,10 @@ $$
 Group Relative Policy Optimization (GRPO, Shao et al. 2024) 是 critic-free 的 PPO 变体。给定一个 prompt $s$，GRPO 用同一份 policy $\pi_{\theta_{\text{old}}}$ 采样 $G$ 条 trajectory（$G$ 称为 group size），得到 reward 集合 $\{R_1, R_2, \ldots, R_G\}$，然后对每条 trajectory 计算**组相对 advantage**：
 
 $$
-\hat{A}_i = \frac{R_i - \mu_g}{\sigma_g + \epsilon}, \quad \mu_g = \frac{1}{G} \sum_{j=1}^G R_j,\quad \sigma_g = \sqrt{\frac{1}{G-1} \sum_{j=1}^G (R_j - \mu_g)^2}
+\hat{A}_i = \frac{R_i - \mu_g}{\sigma_g + \epsilon}, \quad \mu_g = \frac{1}{G} \sum_{j=1}^G R_j,\quad \sigma_g = \sqrt{\frac{1}{G} \sum_{j=1}^G (R_j - \mu_g)^2}
 $$
 
-其中 $\mu_g, \sigma_g$ 是同一 group 内的 reward 均值与标准差。这个组内 z-score 替代了 PPO 的 critic baseline，从而完全消除了 critic head 与 critic loss 的需要。
+其中 $\mu_g, \sigma_g$ 是同一 group 内的 reward 均值与标准差。本实现使用 `torch.std(unbiased=False)`，即 population std。这个组内 z-score 替代了 PPO 的 critic baseline，从而完全消除了 critic head 与 critic loss 的需要。
 
 #### 2.3.2 GRPO 损失函数
 
@@ -188,13 +188,13 @@ $$
 
 #### 2.3.3 z-score 不变性（机制核心）
 
-GRPO 的组相对 advantage 有一个数学性质，对本研究第 5.2 节的反向复现机制根因至关重要：**对同一 group 内的所有 reward 做仿射变换 $R_i \mapsto a R_i + b\;(a > 0)$ 不改变 $\hat{A}_i$**。证明很直接：
+GRPO 的组相对 advantage 有一个数学性质，对本研究第 5.2 节的反向复现机制根因至关重要：**对同一 group 内的所有 reward 做仿射变换 $R_i \mapsto a R_i + b\;(a > 0)$ 基本不改变 $\hat{A}_i$**。证明很直接：
 
 $$
 \hat{A}'_i = \frac{(a R_i + b) - (a \mu_g + b)}{a \sigma_g + \epsilon} = \frac{a (R_i - \mu_g)}{a \sigma_g + \epsilon} \approx \frac{R_i - \mu_g}{\sigma_g + \epsilon} = \hat{A}_i
 $$
 
-（在 $\epsilon$ 远小于 $a \sigma_g$ 时近似严格等于）。这意味着 GRPO 的"学习信号尺度"完全由组内排序决定，与组的整体 reward 量级无关。第 5.2.3 节会用这个性质解释为什么 variance filter 选高方差 group 不能给 GRPO 带来"信号增强"。
+（在 $\epsilon$ 远小于 $a \sigma_g$ 时近似严格等于）。这意味着 GRPO 的"学习信号尺度"主要由组内相对排序决定，与组的整体 reward 量级关系很弱。第 5.2.3 节会用这个性质解释为什么 variance filter 选高方差 group 不能给 GRPO 带来与 PPO critic 类似的"信号增强"。
 
 #### 2.3.4 GRPO 也存在单 mini-batch 退化
 
@@ -233,7 +233,7 @@ $$
 \hat{A}^{\text{token}}_{t,k} = \sum_{l=0}^{K_t - k} (\gamma_{\text{token}} \lambda_{\text{token}})^l \,\delta^{V,\text{token}}_{t,k+l}
 $$
 
-其中 $K_t$ 是 turn $t$ 的 token 数。具体到 PPO，token-level advantage 进入 policy gradient 的 weighting；critic 同时在 turn 边界 state 上学习 value function。论文设置 $\gamma_{\text{turn}} = 1.0, \lambda_{\text{turn}} = 1.0, \gamma_{\text{token}} = 1.0, \lambda_{\text{token}} = 0.95$。
+其中 $K_t$ 是 turn $t$ 的 token 数。具体到 PPO，token-level advantage 进入 policy gradient 的 weighting；critic 同时在 turn 边界 state 上学习 value function。本实现的关键配置是 `gamma=1.0`、`lam=1.0`、`high_level_gamma=0.95`。
 
 #### 2.4.3 StarPO-S：基于 trajectory variance 的 rollout filter
 
@@ -242,7 +242,7 @@ $$
 形式化地，给定 step 内的 $P$ 个 prompt，每个 prompt 用 group size $G$ 采样，得到 $P \cdot G$ 条 trajectory。计算每个 prompt 的组内 reward 方差：
 
 $$
-\text{Var}[R \,|\, p] = \frac{1}{G-1} \sum_{i=1}^G (R_{p,i} - \bar{R}_p)^2,\quad \bar{R}_p = \frac{1}{G} \sum_{i=1}^G R_{p,i}
+\text{Var}[R \,|\, p] = \frac{1}{G} \sum_{i=1}^G (R_{p,i} - \bar{R}_p)^2,\quad \bar{R}_p = \frac{1}{G} \sum_{i=1}^G R_{p,i}
 $$
 
 按 $\text{Var}[R \,|\, p]$ 降序排序，保留前 $r \cdot P$ 个 prompt（$r$ 称为 `variance_filter_ratio`，论文 sweep $r \in \{1.0, 0.5, 0.25\}$）。$r = 1.0$ 等价于不过滤（即 vanilla StarPO），$r = 0.5$ 对应 StarPO-S 中度，$r = 0.25$ 对应 StarPO-S 强度。
@@ -255,7 +255,7 @@ $$
 
 ## 3. 方法与系统设计
 
-本章是工程贡献 C1 的主战场。§3.1 介绍解耦架构，§3.2 描述 PPO/GRPO 的算法实现要点，§3.3 详细展开消费级硬件优化栈的 9 层结构（这是本研究最具复用价值的工程产出），§3.4 介绍受控变量实验设计与数据基础设施。
+本章是工程贡献 C1 的主战场。§3.1 介绍解耦架构，§3.2 描述 PPO/GRPO 的算法实现要点，§3.3 详细展开消费级硬件优化栈的多层结构（这是本研究最具复用价值的工程产出），§3.4 介绍受控变量实验设计与数据基础设施。
 
 ### 3.1 解耦架构设计
 
@@ -275,8 +275,8 @@ $$
 
 解耦设计在本研究中带来三项具体收益：
 
-1. **算法替换零成本**：从 PPO 切换到 GRPO 只需要在训练循环层指定 `--algo grpo`，不需要改任何环境或 agent 代码。本研究的 6 组实验全部用同一份训练循环代码 + 同一份环境实现 + 同一份 agent 实现，仅在 RL 算法层有 PPO vs GRPO 的差异。这保证了第 5 章双线叙事的"控制变量"严格性。
-2. **环境扩展零成本**：论文五个环境（FrozenLake / Sokoban / CartPole / Bandit / Math-Countdown）全部已实现并通过单元测试。本研究的训练实验仅在 FrozenLake 上完成，但其他 4 个环境只需要切换 CLI 开关 `--env_name <name>` 即可立即用同一套训练管线开训。这是第 6 章 future work 的可扩展性基础。
+1. **算法替换零成本**：从 PPO 切换到 GRPO 只需要在训练循环层指定 `--algo grpo`，不需要改任何环境或 agent 代码。本研究的 6 组实验全部用同一份训练循环代码 + 同一份环境实现 + 同一份 agent 实现，仅在 RL 算法层有 PPO vs GRPO 的差异。这保证了第 5 章双线叙事在配置层面的可比性。
+2. **环境扩展零成本**：论文五个环境（FrozenLake / Sokoban / CartPole / Bandit / Math-Countdown）均已实现，并提供 smoke test 路径。本研究的训练实验仅在 FrozenLake 上完成，但其他 4 个环境只需要切换 CLI 开关 `--env <name>` 即可接入同一套训练管线。这是第 6 章 future work 的可扩展性基础。
 3. **配置即真相**：所有超参数通过单一 argparse 入口暴露，配置层是 single source of truth，所有模块只读取配置，不持有自己的默认值副本。这避免了多处隐藏默认值导致的 reproducibility 问题。
 
 ### 3.2 算法实现要点
@@ -311,7 +311,7 @@ PPO 与 GRPO 的 update step 都采用 `gradient clipping`（max_norm = 1.0）�
 
 ### 3.3 消费级硬件优化栈
 
-本节是工程贡献 C1 的核心。把一个 0.5B 模型 + actor-critic 双模型 + reference 模型 + bi-level GAE 的多轮 rollout 完整训练流程跑在 8 GB VRAM 的单卡 + 纯 Windows 环境下，需要在以下九个层级同时做出工程权衡。本节按层级展开，每个优化点给出（i）名称与作用机制、（ii）显存或时间收益、（iii）数学影响（是否等价于 fp32 baseline）。
+本节是工程贡献 C1 的核心。把一个 0.5B 模型 + actor-critic 双模型 + reference 模型 + bi-level GAE 的多轮 rollout 完整训练流程跑在 8 GB VRAM 的单卡 + 纯 Windows 环境下，需要在显存、吞吐和数值正确性三个层面同时做出工程权衡。本节按优化点展开，给出（i）名称与作用机制、（ii）显存或时间收益、（iii）数学影响（是否等价于 fp32 baseline）。
 
 #### 3.3.1 显存优化层（VRAM Layer）
 
@@ -360,9 +360,9 @@ PPO 与 GRPO 都需要一份 reference policy $\pi_{\text{ref}}$ 用于 KL 正�
 
 模型权重使用 `torch.bfloat16` 加载（不是 fp32），节省约 1 GB 模型权重显存。bf16 相比 fp16 数值范围更大，不易 overflow，是 0.5B 量级 RL 训练的事实标准。
 
-##### H. max_seq_length = 1536
+##### H. max_seq_length：默认 2048，后续实验命令覆盖到 1536
 
-论文用 `max_seq_length = 3600`，但本研究的 trajectory 在前期实验中实际平均长度约 800 token，1536 已经足够覆盖 99% 的 trajectory。把 max_seq_length 从 3600 降到 1536 节省约 1 GB（mask + KV 占用），代价是 < 1% 的极端长 trajectory 被截断（这部分轨迹通常本来就质量低）。
+当前代码默认 `max_seq_length = 2048`。早期 no-filter run 使用过默认 2048；后续 filter=0.5 / 0.25 组在 step 100+ 后出现显存压力，因此通过命令行将 `--max_seq_length` 覆盖为 1536。由于本研究的 trajectory 在前期实验中实际平均长度约 800 token，1536 已经足够覆盖绝大多数 trajectory。把 max_seq_length 降到 1536 可节省约 1 GB（mask + activation 占用），代价是少量极端长 trajectory 被截断（这部分轨迹通常本来就质量低）。
 
 ##### I. expandable_segments + 周期性 empty_cache
 
@@ -379,7 +379,7 @@ Windows + 8 GB VRAM 的边缘场景下显存碎片化是隐形杀手。本研究
 | E | **Ref model 禁 checkpointing** | 0 直接 / 节省 ref forward 时间 | ✅ 等价 |
 | F | micro=1 × accum=32 | ~3 GB | ✅ **数学严格等价** |
 | G | bf16 模型权重 | ~1 GB | bf16 vs fp32 数值差异，工业事实标准 |
-| H | max_seq=1536 | ~1 GB | < 1% trajectory 被截断 |
+| H | max_seq=2048/1536 | ~1 GB（1536 配置下） | 少量极端长 trajectory 被截断 |
 | I | expandable_segments | ~0.5 GB effective | ✅ 等价（仅缓解碎片化） |
 
 **累计节省**：约 6–8 GB VRAM，让 0.5B 模型 + 双模型（actor + critic）+ reference 模型 + 多轮 rollout 全流程能在 8 GB 卡上跑完整 200 步训练。
@@ -434,12 +434,12 @@ Tokenizer 的 `padding_side` 通常默认为 `"right"`（适用于训练 forward
 
 #### 3.4.1 受控变量实验设计
 
-6 组实验严格采用 controlled experiment 设计：
+6 组实验尽量采用 controlled experiment 设计：
 
-- **共享变量**（5 项）：seed=42、PPO/GRPO 共享的所有超参数（kl_coef、ent_coef、format_penalty、bi-level GAE 开关、gae_lambda_turn / gae_lambda_token）、所有硬件让步（A–N 全部）、环境配置（FrozenLake is_slippery=True 0.8/0.1/0.1、randomize_map=True、size=4、p=0.6）、agent 模型（Qwen2.5-0.5B-Instruct + bf16）。
-- **唯一变量**：6 组矩阵在两个维度上变化——`algo ∈ {ppo, grpo}` 与 `variance_filter_ratio ∈ {1.0, 0.5, 0.25}`。
+- **共享变量**（5 项）：seed=42、PPO/GRPO 共享的所有超参数（kl_coef、ent_coef、format_penalty、bi-level GAE 开关、`gamma=1.0`、`lam=1.0`、`high_level_gamma=0.95`）、主要硬件让步（显存优化与 rollout 加速栈）、环境配置（FrozenLake is_slippery=True 0.8/0.1/0.1、randomize_map=True、size=4、p=0.9）、agent 模型（Qwen2.5-0.5B-Instruct + bf16）。
+- **主要变量**：6 组矩阵在两个维度上变化——`algo ∈ {ppo, grpo}` 与 `variance_filter_ratio ∈ {1.0, 0.5, 0.25}`。需要说明的是，`max_seq_length` 在实验过程中因显存压力存在 2048/1536 的 B 级工程让步差异；这一点会影响严格 bitwise controlled 的说法，但由于实际 trajectory 长度通常低于 1536，预计不改变本文的组间主序关系。
 
-由于共享 seed=42，所有 6 组实验在 step 1 的 rollout 是字节级一致的，即"输入差异"完全不存在；所有训练动力学差异都由 `algo × filter` 这两个维度的交互产生。这是后续第 5 章双线对比能够下断言的统计学基础。
+由于共享 seed=42、环境配置与模型配置，6 组实验在设计上尽量消除了输入侧差异；但 PPO 初始化 critic、GRPO 无 critic，以及 `max_seq_length` 的后期覆盖，都意味着本研究应被理解为**配置层面的 controlled experiment**，而不是逐字节完全一致的 bitwise replay。后续第 5 章的结论主要建立在大幅组间差异与曲线形态上，而不是单点绝对值。
 
 #### 3.4.2 训练追踪
 
@@ -447,7 +447,7 @@ Tokenizer 的 `padding_side` 通常默认为 `"right"`（适用于训练 forward
 
 #### 3.4.3 评估协议
 
-每 20 个训练 step 在固定的 200 个评估 prompt 上跑一次 evaluation。评估时 agent 用 deterministic mode（temperature → 0），环境保持训练时的随机性配置（is_slippery 0.8/0.1/0.1）。每次 eval 计算 8 个指标：success_rate、avg_reward、avg_trajectory_length、avg_num_actions、action_valid_rate、action_effective_rate、format_compliance、reward_variance。
+每 20 个训练 step 跑一次 200-episode evaluation。评估 episode 的 env seed 由训练进程的 RNG 采样，因此不是跨 step 固定的同一组 prompt；评估时也不额外强制 temperature=0，而是尊重 agent 当前的采样温度配置。环境保持训练时的随机性配置（is_slippery 0.8/0.1/0.1）。每次 eval 计算 8 个指标：success_rate、avg_reward、avg_trajectory_length、avg_num_actions、action_valid_rate、action_effective_rate、format_compliance、reward_variance。
 
 ---
 
@@ -499,8 +499,8 @@ Tokenizer 的 `padding_side` 通常默认为 `"right"`（适用于训练 forward
 | `vf_coef` | 1.0 | 1.0 | ✅ |
 | `clip_ratio` $\epsilon$ | 0.2 | 0.2 | ✅ |
 | `max_grad_norm` | 1.0 | 1.0 | ✅ |
-| `gae_lambda_turn` | 1.0 | 1.0 | ✅ |
-| `gae_lambda_token` | 0.95 | 0.95 | ✅ |
+| `gamma` / `lam` | 1.0 / 1.0 | 1.0 / 1.0 | ✅ |
+| `high_level_gamma` | 0.95 | 0.95 | ✅ |
 | `format_penalty` | -0.1 | -0.1 | ✅ |
 | `variance_filter_ratio` | 扫描 {1.0, 0.5, 0.25} | 扫描 {1.0, 0.5, 0.25} | ✅ |
 
@@ -513,7 +513,7 @@ Tokenizer 的 `padding_side` 通常默认为 `"right"`（适用于训练 forward
 | Rollout 引擎 | 原生 PyTorch + batched + alive-only | vLLM | ❗ | 时间影响（已通过 §3.3.3 优化栈缓解） |
 | 优化器 | adamw8bit + emb 32-bit override | fp32 AdamW | ⚠️ | **C 级让步：无法消除**（详见 §5.3） |
 | `micro_batch_size` × `grad_accum` | 1 × 32 = 32 | 4 × 8 = 32 | ⚠️ | **数学严格等价**（A 级让步：影响=0） |
-| `max_seq_length` | 1536 | 3600 | ⚠️ | < 1% 极端长 trajectory 截断（B 级让步：影响 < 5%） |
+| `max_seq_length` | 默认 2048；后续部分 run 覆盖为 1536 | 3600 | ⚠️ | 少量极端长 trajectory 截断（B 级让步：影响 < 5%） |
 | seed 数 | 1（seed=42） | 多 seed 平均 | ❗ | **D 级让步：无法消除**（影响 20-40%） |
 | `eval_episodes` | 200 | 500 | ⚠️ | 评估方差略大（B 级让步：影响 < 5%） |
 
@@ -522,20 +522,20 @@ Tokenizer 的 `padding_side` 通常默认为 `"right"`（适用于训练 forward
 把所有让步按"对最终结果的影响程度"分为四级：
 
 - **A 级（影响 = 0）**：仅改变实现细节，对最终结果无影响。如 `micro=1 × accum=32` 严格等价于论文 `4 × 8 = 32`，gradient 数学相同。
-- **B 级（影响 < 5%）**：理论上可能影响，但实际影响很小且可量化。如 `max_seq=1536` 截断 < 1% 极端长 trajectory；`eval_episodes=200` 让评估 reward 标准差略大但中位数基本一致。
+- **B 级（影响 < 5%）**：理论上可能影响，但实际影响很小且可量化。如后续部分 run 将 `max_seq_length` 从默认 2048 覆盖到 1536，会截断少量极端长 trajectory；`eval_episodes=200` 会让评估 reward 标准差略大但中位数基本一致。
 - **C 级（影响 5-20%）**：影响明确存在但难以量化，需要 controlled 对照才能精确估计。如 `adamw8bit` 引入约 10-30% 的随机量化漂移在 200 步累积后产生 5-20% 的 reward 波动。**第 5.3 节的 GRPO 实验就是给这一级别让步做的 controlled 对照**。
 - **D 级（影响 20-40%）**：影响很大且无法在本研究硬件预算内消除。最显著的是单 seed=42——单次实验无法区分"形态特异性"与"systematic effect"，需要多 seed 平均才能下确定结论。本研究通过"PPO 三组共享 seed → 内部相对差异比绝对水平更可靠"的策略部分缓解。
 
 ### 4.4 评估指标定义
 
-每个评估点（每 20 步一次）在固定 200 个 episode 上计算 8 项指标：
+每个评估点（每 20 步一次）在 200 个 episode 上计算 8 项指标：
 
-- **`avg_reward`**：trajectory 累计 reward 的均值。FrozenLake 中由 sparse outcome reward (-1, 0, +1) + per-turn format penalty (-0.1) 累加而成，理论范围约 [-1.5, +1.0]。
-- **`success_rate`**：trajectory 末端 reward = +1 的比例（agent 成功到达 goal）。这是最严格的"任务完成度"指标。
+- **`avg_reward`**：evaluation 中 trajectory 原生环境 reward（`env_reward`）的累计均值，不叠加 format penalty。FrozenLake 成功到达 goal 时给正 reward，非法动作会产生小幅负 reward，因此负值主要反映无效动作 / 无效序列，而不是格式惩罚。
+- **`success_rate`**：由 `judge_success` 判定；若环境 `info` 明确给出 `is_success` / `success`，以环境字段为准，否则使用 `terminated and not truncated`。这是最严格的"任务完成度"指标。
 - **`avg_trajectory_length`**：trajectory 平均 turn 数（包括 agent 失败 / 失败的 turn）。
 - **`avg_num_actions`**：每 trajectory 平均 action 数（一个 turn 内 agent 可能输出多个 action）。
-- **`action_valid_rate`**：所有 action 中"语法合法"（即在 `{Up, Down, Left, Right}` 中）的比例。
-- **`action_effective_rate`**：所有 action 中"实际推动 agent 移动"的比例（包括因 is_slippery 反弹的）。
+- **`action_valid_rate`**：turn 级动作合法率，当前实现为 `1 - mean(any_invalid_in_sequence)`。
+- **`action_effective_rate`**：turn 级动作有效率，当前实现为 `mean(all_effective_in_sequence)`。
 - **`format_compliance`**：所有 turn 中输出严格符合 `<think>...</think><answer>...</answer>` 格式的比例。这是 format penalty 的直接监控信号。
 - **`reward_variance`**：trajectory 间 reward 的方差，用于诊断 echo trap（论文 echo trap 时该值应塌陷）。
 
@@ -564,7 +564,7 @@ Tokenizer 的 `padding_side` 通常默认为 `"right"`（适用于训练 forward
 
 下图（图 1）给出 6 组 eval reward 的完整时序对比：
 
-![六组实验 eval reward 演化对比](results/figures/fig01_eval_reward_6groups.png)
+![六组实验 eval reward 演化对比](figures/fig01_eval_reward_6groups.png)
 
 观察：
 - **PPO 维度（实线）**：filter=1.0（红实线）从初始 -0.10 在 step 100 后崩溃到 -0.65；filter=0.5（蓝实线）有先升后降形态、step 120 峰值 -0.054、终点 -0.185；filter=0.25（绿实线）在 -0.10 到 -0.06 之间平稳停滞。**符合论文 P1/P2/P3 三大论点的方向**。
@@ -616,7 +616,7 @@ Tokenizer 的 `padding_side` 通常默认为 `"right"`（适用于训练 forward
 
 形态构成清晰的 **PPO U-shape**：filter 太松不稳定、太严停滞、中度过滤是 sweet spot。这与论文 Figure 5 的 trade-off 形态一致。下图（图 6）从最终 reward 角度给出更直观的对比：
 
-![Variance filter trade-off：PPO U-shape vs GRPO 单调下降](results/figures/fig06_filter_tradeoff_bar.png)
+![Variance filter trade-off：PPO U-shape vs GRPO 单调下降](figures/fig06_filter_tradeoff_bar.png)
 
 PPO 三组（实色 bars）形态：filter=1.0 最差、filter=0.5 中间、filter=0.25 最高；这与论文报告的"filter=0.5 为 sweet spot"略有差异（论文 sweet spot 是 0.5 但本研究终点 reward 是 0.25 最高），但**核心趋势是 U-shape**——本研究的 filter=0.5 在峰值处 (-0.054) 优于 filter=0.25 的所有时点 (-0.106 到 -0.060)。
 
@@ -634,13 +634,13 @@ PPO vanilla 的崩溃形态值得专门讨论，因为它与论文 echo trap 的
 
 下图（图 7）展示 6 组实验的 entropy 形态对比：
 
-![六组实验 train entropy 形态对比](results/figures/fig07_train_entropy_6groups.png)
+![六组实验 train entropy 形态对比](figures/fig07_train_entropy_6groups.png)
 
 PPO + filter=1.0（红实线）的 entropy 单调升高到 1.9+ 区间，在 6 组中 entropy 最高；PPO + filter=0.5（蓝实线）也升到 1.5-1.9 区间但起点更低；PPO + filter=0.25（绿实线）维持在 1.0-1.2 平台。**反观 GRPO 三组（虚线）entropy 全程更低**，特别是 GRPO vanilla 单调下降到 0.19。
 
 KL + grad_norm 的训练动态（图 8）佐证了 PPO vanilla 的"不稳定 → 崩溃"路径：
 
-![六组实验训练动态：KL penalty + grad_norm](results/figures/fig08_train_kl_grad_6groups.png)
+![六组实验训练动态：KL penalty + grad_norm](figures/fig08_train_kl_grad_6groups.png)
 
 观察图 8 (a)：PPO + filter=1.0（红实线）的 kl_penalty 在 step 123 出现极端 spike (~20)，这正是崩溃临界点附近——KL 突刺意味着 policy 在某个 step 内大幅偏离 reference，进入未探索的高 entropy 区域并锁死在乱码模式。GRPO 三组（虚线）全程 KL 维持在 < 0.01 的稳定区间。
 
@@ -657,7 +657,7 @@ filter=0.25 这一组虽然 reward 终点 -0.060 在 PPO 三组中最高，但�
 
 下图（图 9）给出 6 组的 n_grad_steps 时序：
 
-![六组实验 n_grad_steps 对比](results/figures/fig09_n_grad_steps_6groups.png)
+![六组实验 n_grad_steps 对比](figures/fig09_n_grad_steps_6groups.png)
 
 三条横线分别对应 4 / 2 / 1，由数学公式精确决定：
 
@@ -705,19 +705,19 @@ PPO 主线在"是否方向性复现 RAGEN P1/P2/P3"这一研究目标上是成�
 
 更全面的视图：success rate 与 format compliance 时序：
 
-![六组实验 eval success rate 演化](results/figures/fig02_eval_success_6groups.png)
+![六组实验 eval success rate 演化](figures/fig02_eval_success_6groups.png)
 
-![六组实验 eval format compliance 演化](results/figures/fig03_eval_format_6groups.png)
+![六组实验 eval format compliance 演化](figures/fig03_eval_format_6groups.png)
 
 观察 GRPO + filter=1.0（红虚线）的三个突出特征：
 
 1. **唯一 reward 转正的实验**：step 80 起 reward 多次进入正区间，step 180 达到峰值 +0.228、终点 +0.225。
-2. **唯一 success_rate 显著高于 0 的实验**：终点 success_rate=22.5%（图 2 中红虚线远高于其他 5 条）。
+2. **唯一 success_rate 明显高于 0 的实验**：终点 success_rate=22.5%（图 2 中红虚线远高于其他 5 条）。
 3. **唯一 format_compliance 接近论文 baseline 的实验**：终点 format_compliance=80.8%（图 3 中红虚线在 0.8 平台），其他 5 条全部塌陷至 ≤ 0.40。
 
 GRPO 三组的 5 项 eval 指标全景对比见图 4：
 
-![六组实验 eval 五维指标 panel](results/figures/fig04_eval_panel_5metrics.png)
+![六组实验 eval 五维指标 panel](figures/fig04_eval_panel_5metrics.png)
 
 GRPO + filter=1.0 在所有 5 维（reward、success、format、valid、effective）都是 6 组里**最强或并列最强**的。这是单 seed 实验里能下的最强结论。
 
@@ -760,12 +760,12 @@ $$
 \hat{A}_i = \frac{R_i - \mu_g}{\sigma_g + \epsilon}
 $$
 
-这意味着：**只要 group 内 reward 不全相同**，GRPO 对该 group 的"学习信号"在尺度归一化后是相同的。具体来说：
+这意味着：**只要 group 内 reward 不全相同**，GRPO 对该 group 的"学习信号"在尺度归一化后会被压到相近量级。按当前实现的 population variance 计算，具体来说：
 
-- group A：rewards = [0, 0, 0, 0, 0, 0, 0, 1]（variance = 0.109） → z-scores = [-0.42, -0.42, -0.42, -0.42, -0.42, -0.42, -0.42, +2.97]
-- group B：rewards = [-1, -1, -1, -1, +1, +1, +1, +1]（variance = 1.143） → z-scores = [-1.0, -1.0, -1.0, -1.0, +1.0, +1.0, +1.0, +1.0]
+- group A：rewards = [0, 0, 0, 0, 0, 0, 0, 1]（variance = 0.109） → z-scores ≈ [-0.38, -0.38, -0.38, -0.38, -0.38, -0.38, -0.38, +2.65]
+- group B：rewards = [-1, -1, -1, -1, +1, +1, +1, +1]（variance = 1.000） → z-scores = [-1.0, -1.0, -1.0, -1.0, +1.0, +1.0, +1.0, +1.0]
 
-两组 group 的 variance 相差 10×，但 z-score 量级相差仅约 3×。**variance filter 选 group B 而不选 group A，GRPO 实际上几乎不获得"信号增强"——只是单纯减少了 50% 或 75% 的样本数量**。
+两组 group 的 variance 相差约 9×，但 z-score 量级相差不到 3×。**variance filter 选 group B 而不选 group A，GRPO 实际上很难获得 PPO critic 那种直接的"信号增强"——更多是在减少 50% 或 75% 的样本数量**。
 
 ##### 机制 3：PPO-Clip 退化在 PPO 与 GRPO 上同样发生
 
@@ -799,7 +799,7 @@ GRPO vanilla 的训练动态从单一指标看似乎也满足"echo trap"特征�
 
 下图（图 5）给出 PPO vanilla 与 GRPO vanilla 的 4 维直接对比：
 
-![PPO vanilla vs GRPO vanilla 头对头对比](results/figures/fig05_ppo_vs_grpo_vanilla.png)
+![PPO vanilla vs GRPO vanilla 头对头对比](figures/fig05_ppo_vs_grpo_vanilla.png)
 
 观察四个子图：
 
@@ -819,7 +819,7 @@ GRPO vanilla 的训练动态从单一指标看似乎也满足"echo trap"特征�
 
 下图（图 10）构建了一个 echo-trap proxy 三轴对比：
 
-![Echo trap proxy：reward × entropy × format 联合诊断](results/figures/fig10_echo_trap_proxy.png)
+![Echo trap proxy：reward × entropy × format 联合诊断](figures/fig10_echo_trap_proxy.png)
 
 观察：
 
@@ -886,12 +886,12 @@ GRPO 三组提供了一个理想的 controlled 对照：所有硬件让步（ada
 
 **工程贡献（C1）**集中在两个层面：
 
-- **解耦架构（5 模块设计）**：把原 RAGEN 仓库重写为 `envs / agents / rl_algos / ragen_core / evaluation` 5 个模块，每层都有清晰契约，可独立替换或扩展。这一设计在本研究中直接受益于 PPO/GRPO 的算法替换零成本——6 组实验严格 controlled。论文五个环境全部已实现并通过单元测试，新环境只需切换 `--env_name` 即可立即开训。
-- **消费级硬件优化栈**：详见 §3.3，由 (i) 显存优化层 9 项与 (ii) Rollout 加速层 4 项构成。其中两项最具复用价值的工程亮点是 **KV cache 修复** 与 **alive-only 批次收缩**——前者把 rollout 速度提升 3-10 倍，后者再叠加约 1.5-2 倍。整套优化栈让 0.5B 模型的完整 200 步 RL 训练能在单张 8 GB 卡上跑完。除 adamw8bit 是 C 级让步外，其余优化对最终结果的影响均为 0（A 级）或 < 5%（B 级）。在消费级硬件上进行 0.5B–3B 量级 LLM RL 实验时，本套优化栈可作为一份可直接套用的工程参考。
+- **解耦架构（5 模块设计）**：把原 RAGEN 仓库重写为 `envs / agents / rl_algos / ragen_core / evaluation` 5 个模块，每层都有清晰契约，可独立替换或扩展。这一设计在本研究中直接受益于 PPO/GRPO 的算法替换零成本——6 组实验在配置层面保持 controlled。论文五个环境均已实现并提供 smoke test 路径，新环境只需切换 `--env` 即可接入同一训练管线。
+- **消费级硬件优化栈**：详见 §3.3，由 (i) 显存优化层与 (ii) rollout 加速层构成。其中两项最具复用价值的工程亮点是 **KV cache 修复** 与 **alive-only 批次收缩**——前者把 rollout 速度提升 3-10 倍，后者再叠加约 1.5-2 倍。整套优化栈让 0.5B 模型的完整 200 步 RL 训练能在单张 8 GB 卡上跑完。除 adamw8bit 是 C 级让步外，其余优化对最终结果的影响均为 0（A 级）或 < 5%（B 级）。在消费级硬件上进行 0.5B–3B 量级 LLM RL 实验时，本套优化栈可作为一份可直接套用的工程参考。
 
 **研究贡献（C2）**是两条结论 + 一项附带发现：
 
-- **PPO 三组方向性复现 RAGEN P1/P2/P3**：论文的核心论点（vanilla 不稳定、StarPO-S 修复、filter trade-off U-shape）在 PPO 维度上方向性重现，损失修复约 71%，trade-off U-shape 显著。复现强度受限于硬件让步（特别是 adamw8bit 和单 seed），但**方向**完全一致。
+- **PPO 三组方向性复现 RAGEN P1/P2/P3**：论文的核心论点（vanilla 不稳定、StarPO-S 修复、filter trade-off U-shape）在 PPO 维度上方向性重现，损失修复约 71%，trade-off U-shape 清晰。复现强度受限于硬件让步（特别是 adamw8bit 和单 seed），但**方向**完全一致。
 - **GRPO 三组反向复现，揭示算法适用性边界**：variance-based rollout filter 在 GRPO 上完全反向，filter 越激进性能越差。本研究通过 z-score 不变性 + critic 数据增强 + PPO-Clip 退化三层机制根因，证明 variance filter 是为 PPO with critic 设计的稳定化机制，**不直接迁移到 actor-only 的 GRPO**。这是论文未明确讨论的算法适用性边界，也是本研究最值得报告的研究产出。
 - **附带发现**：消费级 GPU 上的 GRPO 比 PPO 更鲁棒——advantage 尺度小一个数量级，对 adamw8bit 量化噪声的 SNR 更高。在 8 GB VRAM 约束下进行 RL 实验时，应优先考虑 GRPO 而非 PPO。
 
@@ -906,11 +906,11 @@ GRPO 三组提供了一个理想的 controlled 对照：所有硬件让步（ada
 - 终点 reward 的绝对值有 ±0.05-0.10 的 seed-level 不确定性
 - 形态特异性（如 PPO + filter=0.5 在 step 120 后下滑、PPO vanilla 的 format collapse）可能部分由 seed=42 引起，无法在单 seed 内排除
 
-**缓解策略**：本研究的核心结论建立在**组间相对差异**而非**绝对值**上。例如"GRPO + filter=1.0 (+0.225) > GRPO + filter=0.5 (-0.079) > GRPO + filter=0.25 (-0.072)"这一序关系在 seed-level 不确定性 ±0.10 内仍然显著（差距 ≥ 0.30）。
+**缓解策略**：本研究的核心结论建立在**组间相对差异**而非**绝对值**上。例如 GRPO + filter=1.0 (+0.225) 明显高于两个 filtered variants（filter=0.5 为 -0.079，filter=0.25 为 -0.072）；后两者几乎并列，而 vanilla 与二者的差距约 0.30，超过本文估计的 seed-level 不确定性。
 
 #### 6.2.2 仅 FrozenLake 一个环境
 
-受限于硬件预算，6 组训练实验全部在 FrozenLake 上完成。论文五个环境的代码已全部实现并通过单元测试，但没有跨环境训练实验。
+受限于硬件预算，6 组训练实验全部在 FrozenLake 上完成。论文五个环境的代码已全部实现，并提供 smoke test / wrapper 检查入口，但没有跨环境训练实验。
 
 **影响**：第 5 章的结论（特别是 §5.2.3 三层机制根因）虽然本身不依赖具体环境，但需要在 Sokoban / CartPole 等其他环境上验证才能下"普适"断言。本研究当前下的是"在多轮交互、稀疏 reward、动态地图、0.5B 模型这一组合下成立"的判断。
 
@@ -922,7 +922,7 @@ GRPO 三组提供了一个理想的 controlled 对照：所有硬件让步（ada
 
 #### 6.2.4 未做 ablation
 
-本研究的硬件优化栈是"全开"的（13 项同时启用），没有逐项 ablation 来量化每项的精确贡献。已知优化里只有 adamw8bit 是 C 级让步，其他都是 A/B 级，所以 ablation 价值不高，但这仍是一个 future work 方向。
+本研究的硬件优化栈是"全开"的（十余项同时启用），没有逐项 ablation 来量化每项的精确贡献。已知优化里只有 adamw8bit 是 C 级让步，其他都是 A/B 级，所以 ablation 价值不高，但这仍是一个 future work 方向。
 
 ### 6.3 Future Work
 
@@ -930,7 +930,7 @@ GRPO 三组提供了一个理想的 controlled 对照：所有硬件让步（ada
 
 #### 6.3.1 跨环境训练（代码已就绪）
 
-论文的五个环境已经全部实现并通过单元测试：
+论文的五个环境已经实现，并提供 smoke test / wrapper 检查入口：
 
 - **Bandit**：单 turn 协议测试，对 RL 算法本身的 sanity check
 - **CartPole**：连续状态文本化、密集 reward shaping，验证算法在 dense reward 下的形态
@@ -938,7 +938,7 @@ GRPO 三组提供了一个理想的 controlled 对照：所有硬件让步（ada
 - **Math-Countdown**：数学推理 verifier，验证 RL 在 reasoning task 上的表现
 - **FrozenLake**：本研究的训练环境
 
-切换到其他 4 个环境只需 CLI 参数 `--env_name <name>`，不需要修改任何其他代码。后续如有更多时间预算，最具研究价值的方向是：
+切换到其他 4 个环境只需 CLI 参数 `--env <name>`，不需要修改核心训练代码。后续如有更多时间预算，最具研究价值的方向是：
 
 - **Sokoban 上重做 PPO × GRPO × filter sweep**：验证 §5.2.3 三层机制根因是否在多步规划任务上仍成立
 - **Math-Countdown 上做 GRPO baseline**：验证 GRPO 在 reasoning task 上的 mode convergence 形态（这与 DeepSeek-R1 的 reasoning RL 设定最接近）
@@ -963,7 +963,7 @@ GRPO 三组提供了一个理想的 controlled 对照：所有硬件让步（ada
 
 本研究在单张 NVIDIA RTX 4070 (8 GB VRAM) 的消费级硬件 + 纯 Windows 环境下，对 RAGEN (Wang et al., 2025) 论文进行了系统化的复现 + 重写 + 算法适用性扩展，交付两条互相佐证的贡献。
 
-**工程贡献**：把原 RAGEN 仓库严格解耦为 5 个模块，并构建 9 层硬件优化栈（涵盖 adamw8bit、KV cache 修复、reference 模型禁 checkpointing、batched rollout 协议、alive-only 批次收缩等关键工程亮点），相比论文 fp32 baseline 节省 6-8 GB VRAM、rollout 提速 3-10 倍。这套优化栈让 0.5B 模型的完整 200 步多轮 RL 训练能在 8 GB 卡上跑完。
+**工程贡献**：把原 RAGEN 仓库严格解耦为 5 个模块，并构建覆盖显存与吞吐的硬件优化栈（涵盖 adamw8bit、KV cache 修复、reference 模型禁 checkpointing、batched rollout 协议、alive-only 批次收缩等关键工程亮点），相比论文 fp32 baseline 节省 6-8 GB VRAM、rollout 提速 3-10 倍。这套优化栈让 0.5B 模型的完整 200 步多轮 RL 训练能在 8 GB 卡上跑完。
 
 **研究贡献**：在 PPO × GRPO × filter ratio 的 2 × 3 = 6 组完整实验矩阵上，方向性复现了论文 PPO 维度的 P1/P2/P3 三大论点（vanilla 不稳定 / StarPO-S 修复 71% / filter trade-off U-shape），同时发现 GRPO 三组的所有论点完全反向：vanilla GRPO 是 6 组里唯一持续学习的实验，达到论文 0.5B baseline 的合理区间（reward = +0.225、success_rate = 22.5%、format_compliance = 80.8%）。通过三层机制根因分析（critic 数据增强 / z-score 不变性 / PPO-Clip 退化）证明 variance-based rollout filter 是为 PPO with critic 设计的稳定化机制，**不直接迁移到 actor-only 的 GRPO**——这是论文未明确讨论的算法适用性边界。
 
@@ -1071,4 +1071,3 @@ filter=0.25 两组（PPO 与 GRPO）的 `clip_frac=0` + `approx_kl=0` 共同证�
 ---
 
 *报告完*
-

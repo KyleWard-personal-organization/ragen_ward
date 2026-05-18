@@ -1,0 +1,22 @@
+\section{Introduction}
+\label{sec:introduction}
+
+Large language models are increasingly used as agents that act in external environments rather than as single-turn text generators. Compared with standard RLHF or preference optimization, multi-turn agent reinforcement learning has three additional difficulties. First, each trajectory contains a sequence of environment turns, and each turn contains a sequence of generated tokens. Second, observations are partial textual renderings of the environment state, so useful behavior depends on context management across turns. Third, rewards are often sparse: most intermediate turns provide little signal, and success or failure may only be known near the end of a trajectory.
+
+RAGEN~\citep{wang2025ragen} studies this setting through a unified State-Thinking-Actions-Reward Policy Optimization framework, or StarPO. It introduces bi-level generalized advantage estimation (GAE) for turn-level and token-level credit assignment, and StarPO-S, a rollout filtering method that keeps high-reward-variance prompts before policy updates. The paper reports broad experiments across environments such as FrozenLake, Sokoban, CartPole, Bandit, and Math-Countdown, using server-grade hardware, vLLM-backed rollout, fp32 AdamW optimizer states, and multi-seed averaging.
+
+This project asks a narrower but practically important question: how much of this system can be reproduced on a single consumer GPU, and what changes when the algorithm is switched from PPO with a critic to critic-free GRPO? The available machine is deliberately modest for LLM RL: a single NVIDIA RTX 4070 with 8 GB VRAM, running on Windows. A literal reproduction of the full RAGEN hardware and software stack is therefore impossible. The project instead follows a controlled-rewrite strategy: preserve the key algorithmic contracts, implement the missing infrastructure in a modular codebase, and make all hardware concessions explicit.
+
+\subsection{Contributions}
+
+The work has two coupled contributions.
+
+\paragraph{C1: engineering reproduction under 8 GB VRAM.}
+The codebase is rewritten into five replaceable modules: environments, agents, RL algorithms, the RAGEN-style training core, and evaluation. On top of this structure, the project implements a consumer-hardware optimization stack that combines AdamW8bit with 32-bit embedding optimizer states, gradient checkpointing, bf16 weights, micro-batching with gradient accumulation, KV-cache restoration for generation, reference-model checkpointing disablement, batched rollout, and alive-only batch shrinking. These changes reduce peak VRAM by roughly 6--8 GB relative to an fp32 AdamW baseline and make 200-step 0.5B-model RL runs feasible on an 8 GB GPU.
+
+\paragraph{C2: algorithmic boundary of variance filtering.}
+The project completes a \(2 \times 3\) matrix over algorithm \(\in\) \{PPO, GRPO\} and variance filter ratio \(\in \{1.0, 0.5, 0.25\}\). PPO directionally reproduces the RAGEN claims: vanilla PPO collapses, moderate filtering delays and reduces the collapse, and very strong filtering becomes stable but stagnant. GRPO, however, behaves in the opposite direction. Vanilla GRPO is the strongest of all six runs, while filtered GRPO variants are weaker. This suggests that the RAGEN variance filter is not algorithm-agnostic: it stabilizes PPO partly by improving critic training data, but it does not transfer directly to actor-only GRPO.
+
+\subsection{Report Organization}
+
+Section~\ref{sec:background} reviews PPO, GRPO, StarPO, bi-level GAE, and variance-based rollout filtering. Section~\ref{sec:system} describes the modular system and the hardware optimization stack. Section~\ref{sec:setup} defines the six-run experiment matrix, the alignment to the RAGEN baseline, and evaluation metrics. Section~\ref{sec:results} presents the results and mechanism analysis. Section~\ref{sec:discussion} discusses limitations and future work, and Section~\ref{sec:conclusion} concludes. Appendix~\ref{sec:appendix} contains detailed tables and training commands.

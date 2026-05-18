@@ -1,0 +1,41 @@
+\section{Limitations and Future Work}
+\label{sec:discussion}
+
+\subsection{Limitations}
+
+\paragraph{Single seed.}
+Each configuration is run only once with seed 42. RL training is seed-sensitive, so absolute reward values and detailed collapse timing should not be overinterpreted. The strongest conclusions rely on relative gaps and curve shapes: for example, GRPO vanilla is roughly 0.30 reward points above the filtered GRPO variants at the end, a gap larger than the expected seed-level noise estimated in the original analysis.
+
+\paragraph{One trained environment.}
+The full training experiments are all on FrozenLake. Other RAGEN-style environments are implemented in the codebase and have smoke-test or wrapper-check paths, but they are not trained in the six-run matrix. Therefore the mechanism claim should be read as applying to the observed setting: multi-turn interaction, sparse rewards, randomized FrozenLake maps, a 0.5B model, one seed, and consumer hardware.
+
+\paragraph{No fp32 AdamW baseline.}
+The hypothesis that AdamW8bit partly contributes to PPO instability is supported indirectly by the GRPO contrast, not by a direct fp32 reproduction. A decisive test would require fp32 AdamW with multiple seeds, which exceeds the available 8 GB VRAM budget.
+
+\paragraph{Filter and sample count are coupled.}
+Variance filtering changes both which prompts are selected and how many trajectories enter each update. Under the available hardware, the project does not run equal-sample controls in which filtered configurations generate more rollouts to compensate for dropped samples. This limitation is especially relevant for GRPO, where the interpretation is that filtering mostly removes samples.
+
+\paragraph{Optimization-stack ablations are not isolated.}
+The engineering stack is enabled as a whole. The report classifies the expected mathematical impact of each concession, but it does not run ablations for each memory or throughput optimization. The most consequential unresolved concession is AdamW8bit; most other changes are implementation-level equivalences or bounded truncation effects.
+
+\subsection{Future Work}
+
+The most valuable next experiments are straightforward.
+
+\paragraph{Multi-seed PPO and GRPO.}
+Repeating the six-run matrix over at least three seeds would separate systematic algorithmic effects from seed-specific collapse modes. This is the first experiment needed before making strong general claims.
+
+\paragraph{Cross-environment training.}
+The codebase is prepared for Bandit, CartPole, Sokoban, Math-Countdown, and FrozenLake through the same environment interface. Sokoban is the most relevant next environment because it stresses multi-step planning. Math-Countdown is the most relevant for reasoning-RL comparison to GRPO-style work.
+
+\paragraph{fp32 or higher-memory optimizer control.}
+A server-side run with fp32 AdamW, or at least a larger-memory GPU allowing a less aggressive optimizer concession, would directly test the quantization-noise hypothesis.
+
+\paragraph{Finer filter sweep.}
+Runs with filter ratio 0.75 would clarify whether GRPO performance degrades monotonically as filtering becomes stronger, and whether PPO's practical sweet spot is closer to 0.5 or another intermediate value under consumer-hardware constraints.
+
+\paragraph{Avoiding 0.25 degeneration.}
+The aggressive-filter runs could be repeated with \code{ppo\_epochs=2} or a smaller effective mini-batch so that PPO-Clip and GRPO-Clip have more than one update opportunity. This would separate true aggressive-filter behavior from the single-mini-batch boundary.
+
+\paragraph{Linux and vLLM migration.}
+Moving the same modular codebase to Linux with vLLM would reduce rollout time and make multi-seed, multi-environment sweeps more affordable.

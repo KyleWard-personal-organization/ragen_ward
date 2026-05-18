@@ -1,0 +1,6 @@
+python scripts/train.py --algo ppo --variance_filter_ratio 1.0 --max_seq_length 1536 --exp_name ragen_baseline_0.5B_ppo_nofilter
+python scripts/train.py --algo ppo --variance_filter_ratio 0.5 --max_seq_length 1536 --exp_name ragen_baseline_0.5B_ppo_filter05
+python scripts/train.py --algo ppo --variance_filter_ratio 0.25 --max_seq_length 1536 --exp_name ragen_baseline_0.5B_ppo_filter025
+python scripts/train.py --algo grpo --variance_filter_ratio 1.0 --max_seq_length 1536 --exp_name ragen_baseline_0.5B_grpo_nofilter
+python scripts/train.py --algo grpo --variance_filter_ratio 0.5 --max_seq_length 1536 --exp_name ragen_baseline_0.5B_grpo_filter05
+python scripts/train.py --algo grpo --variance_filter_ratio 0.25 --max_seq_length 1536 --exp_name ragen_baseline_0.5B_grpo_filter025

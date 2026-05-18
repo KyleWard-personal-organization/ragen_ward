@@ -1,0 +1,63 @@
+\documentclass[11pt]{article}
+
+\usepackage[preprint]{acl}
+
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+\usepackage{xurl}
+\usepackage{seqsplit}
+\usepackage{enumitem}
+\usepackage{fvextra}
+\usepackage{ragged2e}
+\microtypesetup{protrusion=true, expansion=true}
+\setlength{\emergencystretch}{1em}
+\tolerance=1200
+\hyphenpenalty=50
+\exhyphenpenalty=50
+
+\setlength\titlebox{7cm}
+
+\title{RAGEN-Ward: Reproducing Multi-Turn LLM Agent Reinforcement Learning on Consumer Hardware and Probing the Algorithmic Boundary of Variance Filtering}
+
+\author{
+WANG Jianyang \\
+Student ID: 21191450 \\
+HKUST Independent Project \\
+Repository: \url{https://github.com/KyleWard-personal-organization/ragen_ward}
+}
+
+\newcommand{\method}{RAGEN-Ward}
+\newcommand{\code}[1]{\texttt{\seqsplit{#1}}}
+\newcommand{\figw}{0.98\linewidth}
+
+\begin{document}
+\RaggedRight
+\maketitle
+
+\begin{abstract}
+This report presents \method, a consumer-hardware reproduction and extension of RAGEN, a recent framework for reinforcement learning in multi-turn LLM agent environments. Under a single NVIDIA RTX 4070 with 8 GB VRAM and a Windows software stack, the project rewrites the original RAGEN-style pipeline into five modular components, implements a memory and throughput optimization stack for 0.5B-scale LLM reinforcement learning, and completes a six-run experiment matrix over PPO versus GRPO and variance filtering ratios in \(\{1.0, 0.5, 0.25\}\) on FrozenLake. The PPO runs directionally reproduce the main RAGEN claims: vanilla StarPO is unstable, moderate StarPO-S filtering mitigates the collapse, and aggressive filtering induces a trade-off. The GRPO runs, however, reverse the expected pattern: vanilla GRPO is the only configuration that consistently learns, reaching final reward \(+0.225\), success rate \(22.5\%\), and format compliance \(80.8\%\), while stronger variance filtering reduces performance. Mechanistic analysis suggests that variance-based rollout filtering acts as a critic-data amplifier for PPO, but becomes mostly sample removal for actor-only GRPO because group-relative z-scored advantages are scale-invariant. The report further distinguishes PPO format collapse from healthy GRPO mode convergence and argues that entropy alone is an insufficient echo-trap proxy.
+\end{abstract}
+
+\input{sections/01_intro}
+\input{sections/02_background}
+\input{sections/03_system}
+\input{sections/04_setup}
+\input{sections/05_results}
+\input{sections/06_discussion}
+\input{sections/07_conclusion}
+
+\bibliography{custom}
+
+\appendix
+\input{sections/appendix}
+
+\end{document}

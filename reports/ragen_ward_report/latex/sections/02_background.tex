@@ -1,0 +1,82 @@
+\section{Background}
+\label{sec:background}
+
+\subsection{LLM Agent Reinforcement Learning}
+
+In LLM agent RL, the policy \(\pi_\theta\) is a language model. At each environment turn, the model receives a textual observation and produces a response containing reasoning text and an action. In this project, outputs are expected to follow a think/answer structure. The environment maps the answer to a discrete action, transitions to the next state, and returns a reward. This differs from single-turn RLHF~\citep{ouyang2022training}, preference optimization such as DPO~\citep{rafailov2023dpo}, and reasoning-oriented RL such as DeepSeek-R1~\citep{guo2025deepseekr1}, because credit assignment spans both environment turns and generated tokens.
+
+The training objective is to maximize expected return,
+\begin{equation}
+J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}
+\left[\sum_{t=0}^{T}\gamma^t r_t\right],
+\end{equation}
+where \(\tau\) is a trajectory and \(r_t\) is the turn-level reward. The project follows RAGEN in using sparse FrozenLake rewards, a small format penalty, KL regularization against a reference policy, and bi-level advantage estimation.
+
+\subsection{PPO}
+
+PPO~\citep{schulman2017ppo} stabilizes policy-gradient learning by optimizing a clipped surrogate. With old policy \(\pi_{\theta_{\mathrm{old}}}\), ratio
+\begin{equation}
+r_t(\theta) =
+\frac{\pi_\theta(a_t \mid s_t)}
+{\pi_{\theta_{\mathrm{old}}}(a_t \mid s_t)}
+\end{equation}
+and advantage estimate \(\hat{A}_t\), the PPO-Clip objective is
+\begin{align}
+L^{\mathrm{CLIP}}(\theta)
+&= \mathbb{E}_t\left[\min(u_t, v_t)\right], \\
+u_t &= r_t(\theta)\hat{A}_t, \\
+v_t &= \tilde{r}_t(\theta)\hat{A}_t, \\
+\tilde{r}_t(\theta)
+&= \mathrm{clip}\bigl(r_t(\theta),1-\epsilon,1+\epsilon\bigr).
+\end{align}
+The full PPO implementation also includes a value-function loss and entropy regularization,
+\begin{equation}
+\begin{aligned}
+L^{\mathrm{PPO}}(\theta,\phi)
+= {}& -L^{\mathrm{CLIP}}(\theta)
++ c_{\mathrm{vf}}L^{\mathrm{VF}}(\phi) \\
+&- c_{\mathrm{ent}}\mathcal{H}[\pi_\theta]
++ \beta D_{\mathrm{KL}}(\pi_\theta\Vert\pi_{\mathrm{ref}}).
+\end{aligned}
+\end{equation}
+This project uses the RAGEN-aligned coefficients \(c_{\mathrm{vf}}=1.0\), \(c_{\mathrm{ent}}=0.001\), \(\beta=0.001\), and clip ratio \(\epsilon=0.2\). PPO uses an actor learning rate of \(10^{-6}\) and a critic learning rate of \(10^{-5}\).
+
+\paragraph{Bi-level GAE.}
+GAE~\citep{schulman2016gae} computes advantages from temporal-difference residuals,
+\begin{equation}
+\hat{A}_t^{\mathrm{GAE}(\gamma,\lambda)}
+= \sum_{l=0}^{T-t}(\gamma\lambda)^l \delta_{t+l}^{V}.
+\end{equation}
+RAGEN adapts this idea to multi-turn LLM agents through bi-level GAE. A turn-level pass estimates advantages at environment boundaries. A token-level pass then distributes the turn-level signal across generated tokens. The current implementation uses \(\gamma=1.0\), \(\lambda=1.0\), and high-level turn discount \(\gamma_{\mathrm{turn}}=0.95\).
+
+\paragraph{Single-mini-batch degeneration.}
+A key implementation boundary appears when all trajectories selected for an update fit into exactly one mini-batch and the number of PPO epochs is one. On the first forward pass, \(\pi_\theta=\pi_{\theta_{\mathrm{old}}}\), so \(r_t(\theta)=1\), \(\mathrm{clip\_frac}=0\), and approximate KL is zero. The update becomes a KL-regularized single-step policy-gradient update rather than a meaningful PPO-Clip trust-region update. This boundary is central to the interpretation of the \(0.25\) filter-ratio runs.
+
+\subsection{GRPO}
+
+Group Relative Policy Optimization (GRPO)~\citep{shao2024deepseekmath} removes the critic. For each prompt, the old policy samples a group of trajectories with returns \(\{R_1,\ldots,R_G\}\). Each trajectory receives a group-relative z-scored advantage,
+\begin{align}
+\hat{A}_i &= \frac{R_i-\mu_g}{\sigma_g+\varepsilon}, \\
+\mu_g &= \frac{1}{G}\sum_{j=1}^{G}R_j, \\
+\sigma_g &= \sqrt{\frac{1}{G}\sum_{j=1}^{G}(R_j-\mu_g)^2}.
+\end{align}
+The implementation uses the population standard deviation, matching \code{torch.std(unbiased=False)}. GRPO then uses a PPO-style clipped surrogate without a value-function term.
+
+The important property is approximate invariance to positive affine transformations of group rewards. If all rewards in a group are transformed as \(R_i' = aR_i+b\), \(a>0\), then
+\begin{equation}
+\hat{A}_i'
+= \frac{a(R_i-\mu_g)}{a\sigma_g+\varepsilon}
+\approx \frac{R_i-\mu_g}{\sigma_g+\varepsilon}.
+\end{equation}
+Thus GRPO primarily uses within-group ranking and relative separation, not the absolute reward scale. This property explains why selecting only high-variance groups does not amplify GRPO's learning signal in the same way it can help PPO's critic.
+
+\subsection{StarPO and StarPO-S}
+
+StarPO organizes multi-turn LLM agent RL around four components: textual state, thinking text, actions, and rewards. Each turn appends format and length instructions, and malformed outputs receive a per-turn format penalty of \(-0.1\). For FrozenLake, the environment reward is sparse and is not dense-shaped.
+
+StarPO-S adds variance-based rollout filtering. At each training step, \(P\) prompts are sampled, and \(K\) rollouts are generated for each prompt. For each prompt \(p\), the trainer computes
+\begin{equation}
+\mathrm{Var}[R \mid p]
+= \frac{1}{K}\sum_{i=1}^{K}\left(R_{p,i}-\bar{R}_p\right)^2.
+\end{equation}
+Prompts are sorted by this variance, and only the top \(r \cdot P\) prompts are kept, where \(r\) is \code{variance\_filter\_ratio}. RAGEN reports that moderate filtering reduces echo-trap behavior in small-model PPO-style training. This project tests whether that conclusion survives an algorithm switch to GRPO.

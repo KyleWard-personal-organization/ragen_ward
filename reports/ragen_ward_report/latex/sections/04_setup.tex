@@ -1,0 +1,77 @@
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Experiment Matrix}
+
+The experiment matrix contains six 200-step runs:
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabularx}{\linewidth}{c c c X}
+\toprule
+\# & Algorithm & Ratio & Purpose \\
+\midrule
+1 & PPO & 1.0 & Vanilla StarPO baseline \\
+2 & PPO & 0.5 & Moderate StarPO-S filtering \\
+3 & PPO & 0.25 & Aggressive StarPO-S filtering \\
+4 & GRPO & 1.0 & Vanilla actor-only baseline \\
+5 & GRPO & 0.5 & Moderate filtering \\
+6 & GRPO & 0.25 & Aggressive filtering \\
+\bottomrule
+\end{tabularx}
+\caption{Six-run PPO/GRPO by variance-filter-ratio matrix.}
+\label{tab:matrix}
+\end{table}
+
+All runs use seed 42, Qwen2.5-0.5B-Instruct~\citep{yang2024qwen25}, FrozenLake-v1~\citep{brockman2016gym}, sparse reward, randomized maps, \(4 \times 4\) grids, and the RAGEN-aligned slippery transition probabilities \(0.8/0.1/0.1\). Each training step samples \(P=8\) prompts and \(K=16\) rollouts per prompt, giving 128 trajectories before filtering.
+
+\subsection{Alignment to the RAGEN Baseline}
+
+Table~\ref{tab:alignment} summarizes the main aligned and non-aligned settings. The core algorithmic settings are closely aligned, while the hardware and optimizer stack necessarily differ.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+Setting & \method{} & RAGEN baseline & Status \\
+\midrule
+Model & Qwen2.5-0.5B-Instruct & Qwen2.5-0.5B-Instruct & aligned \\
+Environment & FrozenLake-v1 & FrozenLake-v1 & aligned \\
+Training steps & 200 & 200 & aligned \\
+Prompt batch / rollouts & \(8 / 16\) & \(8 / 16\) & aligned \\
+KL coefficient & 0.001 & 0.001 & aligned \\
+Entropy coefficient & 0.001 & 0.001 & aligned \\
+PPO actor / critic LR & \(10^{-6} / 10^{-5}\) & \(10^{-6} / 10^{-5}\) & aligned \\
+Clip ratio & 0.2 & 0.2 & aligned \\
+GAE settings & \(\gamma=1.0,\lambda=1.0,\gamma_{\mathrm{turn}}=0.95\) & same & aligned \\
+Optimizer & AdamW8bit plus fp32 embeddings & fp32 AdamW & hardware concession \\
+Rollout engine & Native PyTorch batched rollout & vLLM-backed rollout & hardware/software concession \\
+Micro-batch / accumulation & \(1 \times 32 = 32\) & \(4 \times 8 = 32\) & mathematically equivalent \\
+Max sequence length & default 2048; some later runs use 1536 & 3600 & bounded concession \\
+Seeds & one seed, 42 & multi-seed average & major limitation \\
+Eval episodes & 200 & 500 & higher evaluation variance \\
+\bottomrule
+\end{tabularx}
+\caption{Parameter alignment and hardware concessions relative to the RAGEN baseline.}
+\label{tab:alignment}
+\end{table*}
+
+The \code{max\_seq\_length} detail is important. The code default remains 2048, and the first no-filter run was initially run with that default. Later filter-ratio runs encountered memory pressure after roughly 100 training steps and were run with \code{--max\_seq\_length 1536}. Since observed trajectories were usually below 1536 tokens, this is treated as a bounded concession rather than a change that explains the main group ordering.
+
+\subsection{Evaluation Protocol and Metrics}
+
+Evaluation runs every 20 training steps for 200 episodes. Evaluation environment seeds are sampled by the training process RNG rather than fixed to an identical prompt set across steps. Evaluation also respects the agent sampling configuration instead of forcing temperature zero.
+
+The main metrics are:
+
+\begin{itemize}
+\item \textbf{Average reward}: mean cumulative environment reward, excluding the format penalty.
+\item \textbf{Success rate}: strict task completion, using environment success fields when available.
+\item \textbf{Format compliance}: fraction of turns matching the required think/answer output format.
+\item \textbf{Action validity and effectiveness}: turn-level action parsing and usefulness rates.
+\item \textbf{Reward variance}: trajectory-level reward variance, used for echo-trap diagnostics.
+\end{itemize}
+
+The analysis emphasizes average reward, success rate, format compliance, entropy, KL penalty, gradient norm, and the number of gradient steps per training iteration.
