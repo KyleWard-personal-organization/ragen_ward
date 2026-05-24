@@ -1,9 +1,132 @@
+\clearpage
+\onecolumn
+\section{Supplementary Results Figures}
+\label{sec:app_figs}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/fig02_eval_success_6groups.png}
+\caption{Evaluation success rate. GRPO vanilla is the only run with substantial task success at the end of training.}
+\label{fig:success}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/fig03_eval_format_6groups.png}
+\caption{Format compliance. GRPO vanilla rises to approximately 0.81, while PPO variants and filtered GRPO variants remain much weaker.}
+\label{fig:format}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.88\textwidth]{figures/fig04_eval_panel_5metrics.png}
+\caption{Five evaluation metrics. GRPO vanilla is strongest or tied strongest across the main evaluation dimensions.}
+\label{fig:panel}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.88\textwidth]{figures/fig05_ppo_vs_grpo_vanilla.png}
+\caption{Head-to-head comparison of PPO vanilla and GRPO vanilla. The two runs move in opposite directions across reward, entropy, format compliance, and success rate.}
+\label{fig:headtohead}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\begin{minipage}{0.48\textwidth}
+\centering
+\includegraphics[width=\linewidth]{figures/fig06_filter_tradeoff_bar.png}
+\end{minipage}\hfill
+\begin{minipage}{0.48\textwidth}
+\centering
+\includegraphics[width=\linewidth]{figures/fig09_n_grad_steps_6groups.png}
+\end{minipage}
+\caption{Left: final-reward view of the filter trade-off. Right: number of optimizer steps under each filter ratio.}
+\label{fig:tradeoff}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/fig07_train_entropy_6groups.png}
+\caption{Training entropy. PPO vanilla moves toward higher entropy during collapse, while GRPO vanilla decreases entropy while improving reward and format compliance.}
+\label{fig:entropy}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/fig08_train_kl_grad_6groups.png}
+\caption{KL penalty and pre-clip gradient norm. PPO runs have much larger gradient norms than GRPO runs, and PPO vanilla shows a large KL spike near the collapse boundary.}
+\label{fig:klgrad}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/fig10_echo_trap_proxy.png}
+\caption{Joint echo-trap proxy. Entropy alone is ambiguous; reward and format compliance separate unhealthy collapse from healthy mode convergence.}
+\label{fig:echoproxy}
+\end{figure}
+
+\clearpage
+\section{Supplementary Implementation Details}
+\label{sec:app_impl}
+
+\begin{table}[!htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+Setting & \method{} & RAGEN baseline & Status \\
+\midrule
+Model & Qwen2.5-0.5B-Instruct & Qwen2.5-0.5B-Instruct & aligned \\
+Environment & FrozenLake-v1 & FrozenLake-v1 & aligned \\
+Training steps & 200 & 200 & aligned \\
+Prompt batch / rollouts & \(8 / 16\) & \(8 / 16\) & aligned \\
+KL coefficient & 0.001 & 0.001 & aligned \\
+Entropy coefficient & 0.001 & 0.001 & aligned \\
+PPO actor / critic LR & \(10^{-6} / 10^{-5}\) & \(10^{-6} / 10^{-5}\) & aligned \\
+Clip ratio & 0.2 & 0.2 & aligned \\
+GAE settings & \(\gamma=1.0,\lambda=1.0,\gamma_{\mathrm{turn}}=0.95\) & same & aligned \\
+Optimizer & AdamW8bit plus fp32 embeddings & fp32 AdamW & hardware concession \\
+Rollout engine & Native PyTorch batched rollout & vLLM-backed rollout & software concession \\
+Micro-batch / accumulation & \(1 \times 32 = 32\) & \(4 \times 8 = 32\) & equivalent mini-batch \\
+Max sequence length & default 2048; some runs use 1536 & 3600 & bounded concession \\
+Seeds & one seed, 42 & multi-seed average & major limitation \\
+Eval episodes & 200 & 500 & higher evaluation variance \\
+\bottomrule
+\end{tabularx}
+\caption{Parameter alignment and hardware concessions relative to the RAGEN baseline.}
+\label{tab:app_alignment}
+\end{table}
+
+\begin{table}[!htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\# & Optimization & Effect and mathematical status \\
+\midrule
+A & AdamW8bit & Saves optimizer-state memory, but introduces block-wise quantization noise. \\
+B & 32-bit embedding states & Keeps embedding optimizer states in fp32 to prevent NaNs. \\
+C & Gradient checkpointing & Saves activation memory at the cost of recomputation; mathematically equivalent. \\
+D & KV-cache restoration & Re-enables generation cache after checkpointing disables it globally; improves rollout speed. \\
+E & Reference no-checkpointing & Disables checkpointing for the frozen reference model, whose forward passes run under no-gradient mode. \\
+F & Micro-batch 1, accumulation 32 & Preserves effective mini-batch size 32; mathematically equivalent but slower. \\
+G & bf16 weights & Saves model-weight memory relative to fp32 and avoids fp16 range issues. \\
+H & Max sequence length & Later runs use 1536 under memory pressure; this truncates only rare long trajectories. \\
+I & Expandable allocator and cache clearing & Reduces effective fragmentation in Windows WDDM edge cases. \\
+\bottomrule
+\end{tabularx}
+\caption{Memory and stability optimizations used to make training feasible on an 8 GB GPU.}
+\label{tab:app_memory}
+\end{table}
+
+\clearpage
 \section{Detailed Evaluation Tables}
 \label{sec:appendix}
 
 \subsection{Average Reward}
 
-\begin{table*}[h]
+\begin{table}[!htbp]
 \centering
 \small
 \begin{tabular}{rrrrrrr}
@@ -24,11 +147,11 @@ Step & PPO 1.0 & PPO 0.5 & PPO 0.25 & GRPO 1.0 & GRPO 0.5 & GRPO 0.25 \\
 \end{tabular}
 \caption{Evaluation average reward over training.}
 \label{tab:app_reward}
-\end{table*}
+\end{table}
 
 \subsection{Success Rate}
 
-\begin{table*}[h]
+\begin{table}[!htbp]
 \centering
 \small
 \begin{tabular}{rrrrrrr}
@@ -49,11 +172,11 @@ Step & PPO 1.0 & PPO 0.5 & PPO 0.25 & GRPO 1.0 & GRPO 0.5 & GRPO 0.25 \\
 \end{tabular}
 \caption{Evaluation success rate over training.}
 \label{tab:app_success}
-\end{table*}
+\end{table}
 
 \subsection{Format Compliance}
 
-\begin{table*}[h]
+\begin{table}[!htbp]
 \centering
 \small
 \begin{tabular}{rrrrrrr}
@@ -74,11 +197,11 @@ Step & PPO 1.0 & PPO 0.5 & PPO 0.25 & GRPO 1.0 & GRPO 0.5 & GRPO 0.25 \\
 \end{tabular}
 \caption{Evaluation format compliance over training.}
 \label{tab:app_format}
-\end{table*}
+\end{table}
 
 \subsection{Training Metric Snapshot}
 
-\begin{table*}[h]
+\begin{table}[!htbp]
 \centering
 \small
 \begin{tabularx}{\textwidth}{lXXXXXX}
@@ -95,15 +218,13 @@ Approx. KL & positive & positive & zero & positive & positive & zero \\
 \end{tabularx}
 \caption{Training metric snapshot used to diagnose degeneration and optimizer-scale differences.}
 \label{tab:app_train}
-\end{table*}
+\end{table}
 
 \clearpage
-\onecolumn
 \section{Training Commands}
 \label{sec:commands}
 
 The current code default for \code{max\_seq\_length} is 2048. The commands below record the reproducible later-run form with an explicit 1536 override. The first no-filter run was originally run with the 2048 default; later runs used the 1536 override because of memory pressure after roughly 100 training iterations.
-
 
 \begin{Verbatim}[fontsize=\small,breaklines=true,breakanywhere=true]
 python scripts/train.py \\
@@ -142,7 +263,6 @@ python scripts/train.py \\
   --max_seq_length 1536 \\
   --exp_name ragen_baseline_0.5B_grpo_filter025
 \end{Verbatim}
-
 
 The Windows environment variable used for memory-fragmentation mitigation is:
 \begin{Verbatim}[fontsize=\small,breaklines=true,breakanywhere=true]

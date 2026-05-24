@@ -1,27 +1,27 @@
-"""results/make_figures.py — 生成最终报告所需的全部图表。
+"""Generate the final result figures.
 
-用法：
-    python results/make_figures.py             # 生成所有图
-    python results/make_figures.py --list      # 列出所有图
-    python results/make_figures.py --only fig01,fig05  # 只生成指定图
+Usage:
+    python results/make_figures.py
+    python results/make_figures.py --list
+    python results/make_figures.py --only fig01,fig05
 
-图表清单：
-  fig01_eval_reward_6groups       —— 6 组 eval reward 曲线（核心主图）
-  fig02_eval_success_6groups      —— 6 组 eval success_rate 曲线
-  fig03_eval_format_6groups       —— 6 组 eval format_compliance 曲线
-  fig04_eval_panel_5metrics       —— 6 组 eval 5 指标多面板（综合视图）
-  fig05_ppo_vs_grpo_vanilla       —— PPO vanilla vs GRPO vanilla 双线叙事核心图
-  fig06_filter_tradeoff_bar       —— filter trade-off 柱状图（PPO U-shape vs GRPO 单调）
-  fig07_train_entropy_6groups     —— 6 组 train entropy 形态对比（mode convergence 证据）
-  fig08_train_kl_grad_6groups     —— 6 组 train kl_penalty + grad_norm 训练动态
-  fig09_n_grad_steps_6groups      —— 6 组 n_grad_steps（filter=0.25 算法退化可视化）
-  fig10_echo_trap_proxy           —— echo trap proxy 形态对比（format collapse vs mode convergence）
+Figure list:
+  fig01_eval_reward_6groups       - eval reward curves for six runs
+  fig02_eval_success_6groups      - eval success_rate curves for six runs
+  fig03_eval_format_6groups       - eval format_compliance curves for six runs
+  fig04_eval_panel_5metrics       - five eval metrics across six runs
+  fig05_ppo_vs_grpo_vanilla       - PPO vanilla vs GRPO vanilla summary
+  fig06_filter_tradeoff_bar       - variance filter trade-off bars
+  fig07_train_entropy_6groups     - train entropy across six runs
+  fig08_train_kl_grad_6groups     - train kl_penalty and grad_norm dynamics
+  fig09_n_grad_steps_6groups      - n_grad_steps under filter settings
+  fig10_echo_trap_proxy           - format collapse vs mode convergence proxy
 
-输出：results/figures/*.png（300 DPI）
+Output: results/figures/*.png at 300 DPI
 
-运行前提：
-- 已激活 conda 环境（项目用 `conda activate CASSC`）
-- 已安装 matplotlib + pandas + numpy
+Requirements:
+- Activate the project environment, for example `conda activate CASSC`
+- Install matplotlib, pandas, and numpy if needed:
   pip install matplotlib pandas numpy
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Dict
 
-# Windows cp936 终端的中文兼容
+# Keep console output UTF-8 on platforms that support reconfiguration.
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -41,10 +41,10 @@ if hasattr(sys.stdout, "reconfigure"):
 try:
     import matplotlib.pyplot as plt
     import numpy as np
-    import pandas as pd  # noqa: F401  -- 间接被 data_loader 使用
+    import pandas as pd  # noqa: F401  -- Imported for data_loader dependency checks
 except ImportError as exc:
-    print(f"[error] 缺依赖: {exc.name}")
-    print("[hint] 在已激活的 conda 环境中执行: pip install matplotlib pandas numpy")
+    print(f"[error] Missing dependency: {exc.name}")
+    print("[hint] In the active conda environment, run: pip install matplotlib pandas numpy")
     sys.exit(1)
 
 from data_loader import RUNS, Run, load_all, smooth, get_run
@@ -56,7 +56,7 @@ FIG_DIR = HERE / "figures"
 FIG_DIR.mkdir(exist_ok=True)
 
 
-# ============== 通用 helpers ==============
+# ============== Shared helpers ==============
 
 def style_for(run: Run, lw: float = 2.0) -> dict:
     return dict(
@@ -71,10 +71,11 @@ def save(
     name: str,
     use_tight: bool = True,
     suptitle_top: float | None = None,
+    crop: bool = True,
 ) -> None:
-    """保存 figure。
-    - use_tight=True 时调用 fig.tight_layout()
-    - 如有 suptitle，传入 suptitle_top（如 0.94）让 tight_layout 给主标题留空间
+    """Save a figure.
+
+    When suptitle_top is set, tight_layout leaves room for the figure title.
     """
     if use_tight:
         if suptitle_top is not None:
@@ -82,7 +83,11 @@ def save(
         else:
             fig.tight_layout()
     out = FIG_DIR / name
-    fig.savefig(out)
+    if crop:
+        fig.savefig(out)
+    else:
+        with plt.rc_context({"savefig.bbox": None}):
+            fig.savefig(out)
     plt.close(fig)
     print(f"  saved: figures/{name}")
 
@@ -95,7 +100,7 @@ def plot_runs_metric(
     smooth_span: int | None = None,
     lw: float = 2.0,
 ) -> None:
-    """在 ax 上叠画所有 6 组的 metric 曲线。"""
+    """Plot one metric for all six runs on an axis."""
     for run in RUNS:
         df = data[run.short][source]
         if metric_key not in df.columns:
@@ -115,8 +120,7 @@ def annotate_point(
     xy_text_axes,
     fontsize: float = 9.5,
 ):
-    """在 (x, y) 数据坐标处加箭头注释，注释框位置使用 axes-fraction 坐标
-    (xy_text_axes 取值范围 [0, 1])，确保不会被 axis 边界裁掉。"""
+    """Annotate a data point with text positioned in axes-fraction space."""
     ax.annotate(
         text,
         xy=(x, y),
@@ -133,7 +137,7 @@ def annotate_point(
 
 
 # ==================================================
-# fig01: 6 组 eval reward 曲线（核心主图）
+# fig01: Eval reward curves for six runs
 # ==================================================
 
 def fig01_eval_reward_6groups(data) -> None:
@@ -141,28 +145,28 @@ def fig01_eval_reward_6groups(data) -> None:
     plot_runs_metric(ax, data, "eval/avg_reward", source="eval")
     ax.axhline(0, color="black", linewidth=0.6, alpha=0.6, zorder=0)
 
-    # GRPO vanilla 峰值标注（axes 右上区）
+    # GRPO vanilla peak annotation.
     g = data["grpo_f10"]["eval"]
     pk_idx = g["eval/avg_reward"].idxmax()
     pk = g.loc[pk_idx]
     annotate_point(
         ax, pk["step"], pk["eval/avg_reward"],
-        f'GRPO vanilla 峰值\n+{pk["eval/avg_reward"]:.3f} @ step {int(pk["step"])}',
+        f'GRPO vanilla peak\n+{pk["eval/avg_reward"]:.3f} @ step {int(pk["step"])}',
         xy_text_axes=(0.42, 0.92),
     )
 
-    # PPO vanilla 终点崩溃标注（axes 右下区）
+    # PPO vanilla final collapse annotation.
     p = data["ppo_f10"]["eval"]
     en = p.iloc[-1]
     annotate_point(
         ax, en["step"], en["eval/avg_reward"],
-        f'PPO vanilla 崩溃\n{en["eval/avg_reward"]:.3f} @ step {int(en["step"])}',
+        f'PPO vanilla collapse\n{en["eval/avg_reward"]:.3f} @ step {int(en["step"])}',
         xy_text_axes=(0.70, 0.30),
     )
 
-    ax.set_xlabel("训练 step")
+    ax.set_xlabel("training step")
     ax.set_ylabel("eval avg_reward")
-    ax.set_title("六组实验 eval reward 演化对比 (PPO 实线 / GRPO 虚线)")
+    ax.set_title("Eval reward across six runs (PPO solid / GRPO dashed)")
     ax.legend(loc="lower left", ncol=2, fontsize=9.5)
     ax.set_xlim(0, 210)
     ax.margins(y=0.10)
@@ -171,7 +175,7 @@ def fig01_eval_reward_6groups(data) -> None:
 
 
 # ==================================================
-# fig02: 6 组 eval success_rate 曲线
+# fig02: Eval success_rate curves for six runs
 # ==================================================
 
 def fig02_eval_success_6groups(data) -> None:
@@ -182,13 +186,13 @@ def fig02_eval_success_6groups(data) -> None:
     en = g.iloc[-1]
     annotate_point(
         ax, en["step"], en["eval/success_rate"],
-        f'GRPO vanilla 终点\nsuccess_rate = {en["eval/success_rate"]:.3f}',
+        f'GRPO vanilla final\nsuccess_rate = {en["eval/success_rate"]:.3f}',
         xy_text_axes=(0.55, 0.55),
     )
 
-    ax.set_xlabel("训练 step")
+    ax.set_xlabel("training step")
     ax.set_ylabel("eval success_rate")
-    ax.set_title("六组实验 eval success_rate 演化对比 (PPO 实线 / GRPO 虚线)")
+    ax.set_title("Eval success_rate across six runs (PPO solid / GRPO dashed)")
     ax.legend(loc="upper left", ncol=2, fontsize=9.5)
     ax.set_xlim(0, 210)
     ax.margins(y=0.12)
@@ -198,7 +202,7 @@ def fig02_eval_success_6groups(data) -> None:
 
 
 # ==================================================
-# fig03: 6 组 eval format_compliance 曲线
+# fig03: Eval format_compliance curves for six runs
 # ==================================================
 
 def fig03_eval_format_6groups(data) -> None:
@@ -209,7 +213,7 @@ def fig03_eval_format_6groups(data) -> None:
     en = g.iloc[-1]
     annotate_point(
         ax, en["step"], en["eval/format_compliance"],
-        f'GRPO vanilla 终点\nformat = {en["eval/format_compliance"]:.3f}',
+        f'GRPO vanilla final\nformat = {en["eval/format_compliance"]:.3f}',
         xy_text_axes=(0.40, 0.92),
     )
 
@@ -217,13 +221,13 @@ def fig03_eval_format_6groups(data) -> None:
     pe = p.iloc[-1]
     annotate_point(
         ax, pe["step"], pe["eval/format_compliance"],
-        f'PPO vanilla 终点\nformat = {pe["eval/format_compliance"]:.3f}',
+        f'PPO vanilla final\nformat = {pe["eval/format_compliance"]:.3f}',
         xy_text_axes=(0.72, 0.20),
     )
 
-    ax.set_xlabel("训练 step")
+    ax.set_xlabel("training step")
     ax.set_ylabel("eval format_compliance")
-    ax.set_title("六组实验 eval format_compliance 演化对比 (PPO 实线 / GRPO 虚线)")
+    ax.set_title("Eval format_compliance across six runs (PPO solid / GRPO dashed)")
     ax.legend(loc="center left", ncol=2, fontsize=9.5)
     ax.set_xlim(0, 210)
     ax.set_ylim(-0.02, 1.02)
@@ -232,7 +236,7 @@ def fig03_eval_format_6groups(data) -> None:
 
 
 # ==================================================
-# fig04: 6 组 eval 5 指标多面板
+# fig04: Five eval metrics across six runs
 # ==================================================
 
 def fig04_eval_panel_5metrics(data) -> None:
@@ -255,7 +259,7 @@ def fig04_eval_panel_5metrics(data) -> None:
         ax.set_title(title)
         ax.set_xlim(0, 210)
 
-    # 最后一个 panel 用作 legend
+    # Use the last panel for the legend.
     legend_ax = axes[-1]
     legend_ax.axis("off")
     handles = []
@@ -263,25 +267,25 @@ def fig04_eval_panel_5metrics(data) -> None:
         line, = legend_ax.plot([], [], label=run.label, **style_for(run, lw=2.5))
         handles.append(line)
     legend_ax.legend(handles=handles, loc="center", fontsize=12, frameon=True,
-                     title="实验组（6 组）", title_fontsize=12)
+                     title="Runs", title_fontsize=12)
 
-    fig.suptitle("六组实验 eval 五指标多面板对比", fontsize=14, fontweight="bold", y=0.99)
+    fig.suptitle("Five eval metrics across six runs", fontsize=14, fontweight="bold", y=0.99)
     save(fig, "fig04_eval_panel_5metrics.png", suptitle_top=0.94)
 
 
 # ==================================================
-# fig05: PPO vs GRPO vanilla 双线叙事核心图
+# fig05: PPO vs GRPO vanilla summary
 # ==================================================
 
 def fig05_ppo_vs_grpo_vanilla(data) -> None:
     panels = [
-        ("eval/avg_reward",        "eval avg_reward",        "(a) eval reward (主性能信号)"),
+        ("eval/avg_reward",        "eval avg_reward",        "(a) eval reward"),
         ("eval/format_compliance", "eval format_compliance", "(b) eval format_compliance"),
         ("eval/success_rate",      "eval success_rate",      "(c) eval success_rate"),
     ]
 
     train_panels = [
-        ("train/entropy", "train entropy", "(d) train entropy (锐化方向相反)"),
+        ("train/entropy", "train entropy", "(d) train entropy"),
     ]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 9.5))
@@ -309,30 +313,30 @@ def fig05_ppo_vs_grpo_vanilla(data) -> None:
                 label=run.label, **style_for(run, lw=2.4))
     ax.set_xlabel("step")
     ax.set_ylabel("train entropy (EWM-8 smoothed)")
-    ax.set_title("(d) train entropy (锐化方向相反)")
+    ax.set_title("(d) train entropy")
     ax.set_xlim(0, 210)
     ax.legend(loc="best", fontsize=10)
 
-    # 在 (d) 中部右侧添加 mode convergence vs format collapse 注释
+    # Add a compact note contrasting the two failure modes.
     ax.text(
         0.98, 0.50,
-        "PPO: entropy ↑ + format ↓\n→ format collapse\n\n"
-        "GRPO: entropy ↓ + format ↑\n→ mode convergence",
+        "PPO: entropy up + format down\n-> format collapse\n\n"
+        "GRPO: entropy down + format up\n-> mode convergence",
         transform=ax.transAxes, fontsize=9, ha="right", va="center",
         bbox=dict(boxstyle="round,pad=0.4", fc="#fff8d8", ec="0.6", alpha=0.92),
     )
 
-    fig.suptitle("PPO vanilla vs GRPO vanilla：双线叙事核心对比 (filter=1.0)",
+    fig.suptitle("PPO vanilla vs GRPO vanilla (filter=1.0)",
                  fontsize=14, fontweight="bold", y=0.99)
     save(fig, "fig05_ppo_vs_grpo_vanilla.png", suptitle_top=0.94)
 
 
 # ==================================================
-# fig06: filter trade-off 柱状图
+# fig06: Filter trade-off bars
 # ==================================================
 
 def _final_eval(data, short: str, key: str, last_n: int = 3) -> float:
-    """取最后 N 个 eval 点的均值（终点 ± 噪声平滑）。"""
+    """Average the last N eval points to smooth endpoint noise."""
     df = data[short]["eval"]
     return float(df[key].tail(last_n).mean())
 
@@ -342,12 +346,13 @@ def fig06_filter_tradeoff_bar(data) -> None:
     x_labels = ["filter=1.0", "filter=0.5", "filter=0.25"]
 
     metrics_to_plot = [
-        ("eval/avg_reward", "eval avg_reward", "(a) eval reward (终点)"),
-        ("eval/success_rate", "eval success_rate", "(b) eval success_rate (终点)"),
-        ("eval/format_compliance", "eval format_compliance", "(c) eval format_compliance (终点)"),
+        ("eval/avg_reward", "eval avg_reward", "(a) final eval reward"),
+        ("eval/success_rate", "eval success_rate", "(b) final eval success_rate"),
+        ("eval/format_compliance", "eval format_compliance", "(c) final eval format_compliance"),
     ]
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5.6))
+    fig.subplots_adjust(left=0.06, right=0.985, top=0.78, bottom=0.24, wspace=0.28)
 
     bar_w = 0.36
     x = np.arange(len(filters))
@@ -366,7 +371,7 @@ def fig06_filter_tradeoff_bar(data) -> None:
                     color=[FILTER_COLORS[f] for f in filters], edgecolor="black", linewidth=1.0,
                     hatch="///")
 
-        # 数值标签
+        # Value labels.
         for bars, vals in ((b1, ppo_vals), (b2, grpo_vals)):
             for bar, v in zip(bars, vals):
                 offset = 0.01 * (max(abs(np.array(ppo_vals + grpo_vals))) or 1.0)
@@ -380,85 +385,93 @@ def fig06_filter_tradeoff_bar(data) -> None:
         ax.set_xticklabels(x_labels)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
+        ax.margins(y=0.18)
         if key == "eval/avg_reward":
             ax.axhline(0, color="black", linewidth=0.7, alpha=0.7)
 
-    # 共享 legend
+    # Shared legend.
     handles = [
-        plt.Rectangle((0, 0), 1, 1, color="0.5", edgecolor="black", label="PPO (实色)"),
-        plt.Rectangle((0, 0), 1, 1, color="0.5", edgecolor="black", hatch="///", label="GRPO (斜线填充)"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="0.5", edgecolor="black", label="PPO (solid fill)"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="0.5", edgecolor="black", hatch="///", label="GRPO (hatched fill)"),
     ]
     fig.legend(handles=handles, loc="lower center", ncol=2, fontsize=11,
-               bbox_to_anchor=(0.5, -0.02))
+               bbox_to_anchor=(0.5, 0.035))
 
-    fig.suptitle("Variance filter trade-off：PPO U-shape vs GRPO 单调下降",
+    fig.suptitle("Variance filter trade-off: PPO U-shape vs GRPO monotonic decline",
                  fontsize=14, fontweight="bold", y=0.99)
-    save(fig, "fig06_filter_tradeoff_bar.png", suptitle_top=0.92)
+    save(fig, "fig06_filter_tradeoff_bar.png", use_tight=False)
 
 
 # ==================================================
-# fig07: 6 组 train entropy 对比
+# fig07: Train entropy across six runs
 # ==================================================
 
 def fig07_train_entropy_6groups(data) -> None:
     fig, ax = plt.subplots(figsize=(11.5, 6.5))
+    fig.subplots_adjust(left=0.09, right=0.985, top=0.82, bottom=0.24)
+    handles = []
     for run in RUNS:
         df = data[run.short]["train"]
-        ax.plot(df["step"], smooth(df["train/entropy"], span=10),
-                label=run.label, **style_for(run, lw=2.0))
+        line, = ax.plot(df["step"], smooth(df["train/entropy"], span=10),
+                        label=run.label, **style_for(run, lw=2.0))
+        handles.append(line)
 
-    ax.set_xlabel("训练 step")
+    ax.set_xlabel("training step")
     ax.set_ylabel("train entropy (EWM-10 smoothed)")
     ax.set_title(
-        "六组实验 train entropy 形态对比 (PPO 实线 / GRPO 虚线)\n"
-        "GRPO vanilla 单调下降 → mode convergence；PPO vanilla 升高 → format collapse",
+        "Train entropy across six runs (PPO solid / GRPO dashed)\n"
+        "GRPO vanilla declines toward mode convergence; PPO vanilla rises toward format collapse",
         fontsize=12, pad=12,
     )
-    ax.legend(loc="center right", ncol=2, fontsize=9.5)
     ax.set_xlim(0, 210)
+    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=9.5,
+               bbox_to_anchor=(0.5, 0.045), framealpha=0.95)
 
-    save(fig, "fig07_train_entropy_6groups.png")
+    save(fig, "fig07_train_entropy_6groups.png", use_tight=False, crop=False)
 
 
 # ==================================================
-# fig08: 6 组 train kl_penalty + grad_norm
+# fig08: Train kl_penalty and grad_norm
 # ==================================================
 
 def fig08_train_kl_grad_6groups(data) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig.subplots_adjust(left=0.07, right=0.985, top=0.78, bottom=0.23, wspace=0.20)
 
     # KL penalty
     ax = axes[0]
+    handles = []
     for run in RUNS:
         df = data[run.short]["train"]
-        ax.plot(df["step"], smooth(df["train/kl_penalty"], span=8),
-                label=run.label, **style_for(run, lw=2.0))
-    ax.set_xlabel("训练 step")
+        line, = ax.plot(df["step"], smooth(df["train/kl_penalty"], span=8),
+                        label=run.label, **style_for(run, lw=2.0))
+        handles.append(line)
+    ax.set_xlabel("training step")
     ax.set_ylabel("train kl_penalty (EWM-8 smoothed)")
-    ax.set_title("(a) train kl_penalty 演化")
+    ax.set_title("(a) train kl_penalty")
     ax.set_xlim(0, 210)
-    ax.legend(loc="upper right", fontsize=9, ncol=2)
 
-    # Grad norm (log scale 因为量级跨度大)
+    # Grad norm uses log scale because the values span orders of magnitude.
     ax = axes[1]
     for run in RUNS:
         df = data[run.short]["train"]
         ax.plot(df["step"], smooth(df["train/grad_norm"], span=8),
                 label=run.label, **style_for(run, lw=2.0))
-    ax.set_xlabel("训练 step")
+    ax.set_xlabel("training step")
     ax.set_ylabel("train grad_norm (EWM-8, log scale)")
     ax.set_yscale("log")
-    ax.set_title("(b) train grad_norm 演化（log scale）")
+    ax.set_title("(b) train grad_norm (log scale)")
     ax.set_xlim(0, 210)
-    ax.legend(loc="upper right", fontsize=9, ncol=2)
 
-    fig.suptitle("六组实验训练动态：KL penalty + grad_norm",
+    fig.suptitle("Training dynamics across six runs: KL penalty and grad_norm",
                  fontsize=14, fontweight="bold", y=0.99)
-    save(fig, "fig08_train_kl_grad_6groups.png", suptitle_top=0.93)
+    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=9,
+               bbox_to_anchor=(0.5, 0.045), framealpha=0.95)
+    save(fig, "fig08_train_kl_grad_6groups.png", use_tight=False, crop=False)
 
 
 # ==================================================
-# fig09: 6 组 n_grad_steps（filter=0.25 算法退化可视化）
+# fig09: n_grad_steps across six runs
 # ==================================================
 
 def fig09_n_grad_steps_6groups(data) -> None:
@@ -470,31 +483,31 @@ def fig09_n_grad_steps_6groups(data) -> None:
         ax.plot(df["step"], df["train/n_grad_steps"],
                 label=run.label, **style_for(run, lw=2.0))
 
-    ax.set_xlabel("训练 step")
+    ax.set_xlabel("training step")
     ax.set_ylabel("train n_grad_steps")
     ax.set_title(
-        "六组实验 n_grad_steps 对比 (filter=0.25 全程退化为 1)\n"
-        "filter=0.25 → 64 traj ≤ mini_batch=64 → ratio=1 → clip 不触发 → 退化为 single-step REINFORCE",
+        "n_grad_steps across six runs (filter=0.25 stays at 1)\n"
+        "filter=0.25: 64 trajectories <= mini_batch=64, ratio=1, clip inactive -> single-step REINFORCE",
         fontsize=11.5, pad=12,
     )
     ax.legend(loc="center right", fontsize=9.5, ncol=2)
     ax.set_xlim(0, 210)
 
-    # 在 y=1 处加水平参考线
+    # Reference line at y=1.
     ax.axhline(1, color="black", linewidth=0.8, alpha=0.5, linestyle=":")
 
     save(fig, "fig09_n_grad_steps_6groups.png")
 
 
 # ==================================================
-# fig10: echo trap proxy 对比图
+# fig10: Echo trap proxy comparison
 # ==================================================
 
 def fig10_echo_trap_proxy(data) -> None:
-    """左 = PPO vanilla（format collapse），右 = GRPO vanilla（mode convergence），
-    每个子图同时显示 entropy / format / reward 三轴信号。
-    三轴外置布局 → 用手动 subplots_adjust + 公共 figure 底部 legend，
-    避免 axes 内 legend 与多行 axes title 视觉挤压。
+    """Compare PPO vanilla and GRPO vanilla with reward, format, and entropy.
+
+    The third y-axis is placed outside the panel, and a shared figure legend is
+    placed at the bottom to keep labels from crowding the plot area.
     """
     fig, axes = plt.subplots(1, 2, figsize=(16.5, 7.8))
     fig.subplots_adjust(
@@ -503,26 +516,26 @@ def fig10_echo_trap_proxy(data) -> None:
 
     cases = [
         ("ppo_f10",
-         "(a) PPO vanilla\nentropy ↑ + format ↓ + reward ↓ → format collapse"),
+         "(a) PPO vanilla\nentropy up + format down + reward down -> format collapse"),
         ("grpo_f10",
-         "(b) GRPO vanilla\nentropy ↓ + format ↑ + reward ↑ → mode convergence"),
+         "(b) GRPO vanilla\nentropy down + format up + reward up -> mode convergence"),
     ]
 
-    saved_handles = None  # 第一次 panel 生成的三条线作为 figure 底部 legend handles
+    saved_handles = None  # First-panel lines become the shared legend handles.
     for ax, (short, title) in zip(axes, cases):
         train_df = data[short]["train"]
         eval_df = data[short]["eval"]
 
-        # 主轴 = reward (红)
+        # Primary axis: reward.
         l1, = ax.plot(eval_df["step"], eval_df["eval/avg_reward"],
                       color="#D62728", linewidth=2.4, label="eval avg_reward")
-        ax.set_xlabel("训练 step")
+        ax.set_xlabel("training step")
         ax.set_ylabel("eval avg_reward", color="#D62728")
         ax.tick_params(axis="y", labelcolor="#D62728")
         ax.set_xlim(0, 210)
         ax.axhline(0, color="black", linewidth=0.5, alpha=0.6, zorder=0)
 
-        # 副轴 1：format (绿)
+        # Secondary axis 1: format.
         ax2 = ax.twinx()
         l2, = ax2.plot(eval_df["step"], eval_df["eval/format_compliance"],
                        color="#2CA02C", linewidth=2.0, linestyle="--",
@@ -531,7 +544,7 @@ def fig10_echo_trap_proxy(data) -> None:
         ax2.tick_params(axis="y", labelcolor="#2CA02C")
         ax2.set_ylim(-0.02, 1.02)
 
-        # 副轴 2：entropy (蓝，外置 axes 1.18 处)
+        # Secondary axis 2: entropy, offset to the right.
         ax3 = ax.twinx()
         ax3.spines["right"].set_position(("axes", 1.18))
         l3, = ax3.plot(train_df["step"], smooth(train_df["train/entropy"], span=8),
@@ -544,24 +557,24 @@ def fig10_echo_trap_proxy(data) -> None:
         if saved_handles is None:
             saved_handles = [l1, l2, l3]
 
-    # 公共 figure 底部 legend，避免 axes 内 legend 挤压
+    # Shared bottom legend.
     fig.legend(
         handles=saved_handles,
-        labels=["eval avg_reward (红)",
-                "eval format_compliance (绿)",
-                "train entropy, EWM-8 smoothed (蓝)"],
+        labels=["eval avg_reward (red)",
+                "eval format_compliance (green)",
+                "train entropy, EWM-8 smoothed (blue)"],
         loc="lower center", ncol=3, fontsize=11,
         bbox_to_anchor=(0.5, 0.04),
         framealpha=0.95,
     )
 
-    fig.suptitle("Echo trap proxy 形态对比：format collapse vs mode convergence",
+    fig.suptitle("Echo trap proxy: format collapse vs mode convergence",
                  fontsize=14, fontweight="bold", y=0.96)
     save(fig, "fig10_echo_trap_proxy.png", use_tight=False)
 
 
 # ==================================================
-# 入口
+# Entry point
 # ==================================================
 
 ALL_FIGURES: Dict[str, Callable] = {
@@ -579,14 +592,14 @@ ALL_FIGURES: Dict[str, Callable] = {
 
 
 def main():
-    parser = argparse.ArgumentParser(description="生成最终报告所需的全部图表")
+    parser = argparse.ArgumentParser(description="Generate the final result figures")
     parser.add_argument("--only", default=None,
-                        help="仅生成指定的 figure（逗号分隔），例如 fig01,fig05")
-    parser.add_argument("--list", action="store_true", help="列出所有可用图")
+                        help="Generate only selected figures, comma-separated, for example fig01,fig05")
+    parser.add_argument("--list", action="store_true", help="List available figures")
     args = parser.parse_args()
 
     if args.list:
-        print("可用图表：")
+        print("Available figures:")
         for name, fn in ALL_FIGURES.items():
             doc = (fn.__doc__ or "").strip().split("\n")[0]
             print(f"  {name}  {doc}")
@@ -594,9 +607,9 @@ def main():
 
     chosen_font = init_style()
     if chosen_font is None:
-        print("[warn] 未找到中文字体；标签可能显示为方框。建议安装 'Microsoft YaHei' 或 'SimHei'。")
+        print("[warn] No plotting font was configured.")
     else:
-        print(f"[info] 使用字体: {chosen_font}")
+        print(f"[info] Using font: {chosen_font}")
 
     targets = (
         list(ALL_FIGURES.keys())
@@ -604,21 +617,21 @@ def main():
         else [s.strip() for s in args.only.split(",") if s.strip()]
     )
 
-    print(f"[info] 加载 6 组实验数据...")
+    print(f"[info] Loading six experiment runs...")
     data = load_all()
     for short, dfs in data.items():
         n_train = len(dfs["train"])
         n_eval = len(dfs["eval"])
-        print(f"  {short}: train={n_train} 行, eval={n_eval} 行")
+        print(f"  {short}: train={n_train} rows, eval={n_eval} rows")
 
-    print(f"[info] 开始生成图表，输出目录: results/figures/")
+    print(f"[info] Generating figures into results/figures/")
     for tgt in targets:
         if tgt not in ALL_FIGURES:
-            print(f"[warn] 未知图表: {tgt}（可用: {list(ALL_FIGURES.keys())}）")
+            print(f"[warn] Unknown figure: {tgt} (available: {list(ALL_FIGURES.keys())})")
             continue
         ALL_FIGURES[tgt](data)
 
-    print(f"\n[done] 共生成 {len(targets)} 张图。位于 results/figures/")
+    print(f"\n[done] Generated {len(targets)} figures in results/figures/")
 
 
 if __name__ == "__main__":

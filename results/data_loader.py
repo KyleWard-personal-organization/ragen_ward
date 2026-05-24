@@ -1,11 +1,11 @@
-"""results/data_loader.py — 读取 6 组实验的 metrics.jsonl 文件。
+"""Load metrics.jsonl files for the six result runs.
 
-每组实验对应一个 `<exp_name>_metrics.jsonl`，每行是一个 JSON 对象。
-按字段前缀拆分为 train / eval 两份 DataFrame。
+Each run corresponds to one `<exp_name>_metrics.jsonl` file, with one JSON
+object per line. Rows are split into train and eval DataFrames by metric prefix.
 
-PPO 与 GRPO 的 schema 略有不同：
-- PPO 有 `train/critic_loss` 和 `train/in_group_reward_std`
-- GRPO 有 `train/group_adv_mean` 和 `train/group_adv_std`，没有 critic
+PPO and GRPO expose slightly different schemas:
+- PPO has `train/critic_loss` and `train/in_group_reward_std`
+- GRPO has `train/group_adv_mean` and `train/group_adv_std`, but no critic
 """
 from __future__ import annotations
 
@@ -24,20 +24,20 @@ LOG_DIR = REPO_ROOT / "logs"
 
 @dataclass(frozen=True)
 class Run:
-    """一组实验的元数据。"""
+    """Metadata for one experiment run."""
     algo: str               # 'ppo' or 'grpo'
     filter_ratio: float     # 1.0, 0.5, or 0.25
     file_stem: str          # logs/<file_stem>_metrics.jsonl
-    label: str              # 用于图例的完整名
-    short_label: str        # 用于 panel 内紧凑显示
-    short: str              # 用于 dict key + 文件名
+    label: str              # Full legend label
+    short_label: str        # Compact panel label
+    short: str              # Dict key and filename id
 
     @property
     def linestyle(self) -> str:
         return "-" if self.algo == "ppo" else "--"
 
 
-# 6 组实验 —— 对应 logs/ 中的 metrics 文件
+# Six runs, each mapped to one metrics file under logs/.
 RUNS = [
     Run("ppo",  1.00, "ragen_baseline_0.5B_ppo_nofilter",     "PPO + filter=1.0",  "PPO 1.0",  "ppo_f10"),
     Run("ppo",  0.50, "ragen_baseline_0.5B_ppo_filter05_v2",  "PPO + filter=0.5",  "PPO 0.5",  "ppo_f05"),
@@ -49,7 +49,7 @@ RUNS = [
 
 
 def load_run(run: Run) -> Dict[str, pd.DataFrame]:
-    """读取单组实验，返回 {'train': df, 'eval': df}。"""
+    """Load one run and return {'train': df, 'eval': df}."""
     path = LOG_DIR / f"{run.file_stem}_metrics.jsonl"
     if not path.exists():
         raise FileNotFoundError(f"Missing metrics file: {path}")
@@ -83,8 +83,8 @@ def load_run(run: Run) -> Dict[str, pd.DataFrame]:
         if eval_rows else pd.DataFrame()
     )
 
-    # 同一 step 出现多次记录时取数值列均值（处理 step=200 同时存在
-    # "训练循环周期 eval" + "训练结束 final eval" 两条记录的情况）
+    # Average duplicate numeric rows at the same step. This handles cases where
+    # periodic eval and final eval rows are both present at the last step.
     if not eval_df.empty:
         num_cols = eval_df.select_dtypes(include="number").columns
         eval_df = (
@@ -101,17 +101,17 @@ def load_run(run: Run) -> Dict[str, pd.DataFrame]:
 
 
 def load_all() -> Dict[str, Dict[str, pd.DataFrame]]:
-    """读取全部 6 组实验。返回 {short: {'train': df, 'eval': df}}。"""
+    """Load all six runs as {short: {'train': df, 'eval': df}}."""
     return {run.short: load_run(run) for run in RUNS}
 
 
 def smooth(s: pd.Series, span: int = 10) -> pd.Series:
-    """指数加权平滑（保留首尾、抑制 step-level 噪声）。"""
+    """Exponentially weighted smoothing for step-level noise."""
     return s.ewm(span=span, adjust=False).mean()
 
 
 def get_run(short: str) -> Run:
-    """按 short id 查找一组实验。"""
+    """Find a run by short id."""
     for r in RUNS:
         if r.short == short:
             return r

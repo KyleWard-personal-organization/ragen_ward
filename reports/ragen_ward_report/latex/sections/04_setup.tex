@@ -3,7 +3,7 @@
 
 \subsection{Experiment Matrix}
 
-The experiment matrix contains six 200-step runs:
+The experiments form a \(2 \times 3\) matrix over algorithm and variance-filter ratio.
 
 \begin{table}[t]
 \centering
@@ -24,54 +24,16 @@ The experiment matrix contains six 200-step runs:
 \label{tab:matrix}
 \end{table}
 
-All runs use seed 42, Qwen2.5-0.5B-Instruct~\citep{yang2024qwen25}, FrozenLake-v1~\citep{brockman2016gym}, sparse reward, randomized maps, \(4 \times 4\) grids, and the RAGEN-aligned slippery transition probabilities \(0.8/0.1/0.1\). Each training step samples \(P=8\) prompts and \(K=16\) rollouts per prompt, giving 128 trajectories before filtering.
+All runs train for 200 steps with seed 42, Qwen2.5-0.5B-Instruct~\citep{yang2024qwen25}, FrozenLake-v1~\citep{brockman2016gym}, sparse reward, randomized \(4\times4\) maps, and RAGEN-aligned slippery transitions \(0.8/0.1/0.1\). Each training step samples \(P=8\) prompts and \(K=16\) rollouts per prompt, giving 128 trajectories before filtering.
 
-\subsection{Alignment to the RAGEN Baseline}
+\subsection{Baseline Alignment}
 
-Table~\ref{tab:alignment} summarizes the main aligned and non-aligned settings. The core algorithmic settings are closely aligned, while the hardware and optimizer stack necessarily differ.
+The core algorithmic settings follow the RAGEN 0.5B FrozenLake baseline: actor learning rate \(10^{-6}\), critic learning rate \(10^{-5}\), KL coefficient 0.001, entropy coefficient 0.001, PPO clip ratio 0.2, value-loss coefficient 1.0, \(\gamma=1.0\), \(\lambda=1.0\), turn-level discount 0.95, format penalty \(-0.1\), and effective mini-batch size 32.
 
-\begin{table*}[t]
-\centering
-\small
-\begin{tabularx}{\textwidth}{lXXX}
-\toprule
-Setting & \method{} & RAGEN baseline & Status \\
-\midrule
-Model & Qwen2.5-0.5B-Instruct & Qwen2.5-0.5B-Instruct & aligned \\
-Environment & FrozenLake-v1 & FrozenLake-v1 & aligned \\
-Training steps & 200 & 200 & aligned \\
-Prompt batch / rollouts & \(8 / 16\) & \(8 / 16\) & aligned \\
-KL coefficient & 0.001 & 0.001 & aligned \\
-Entropy coefficient & 0.001 & 0.001 & aligned \\
-PPO actor / critic LR & \(10^{-6} / 10^{-5}\) & \(10^{-6} / 10^{-5}\) & aligned \\
-Clip ratio & 0.2 & 0.2 & aligned \\
-GAE settings & \(\gamma=1.0,\lambda=1.0,\gamma_{\mathrm{turn}}=0.95\) & same & aligned \\
-Optimizer & AdamW8bit plus fp32 embeddings & fp32 AdamW & hardware concession \\
-Rollout engine & Native PyTorch batched rollout & vLLM-backed rollout & hardware/software concession \\
-Micro-batch / accumulation & \(1 \times 32 = 32\) & \(4 \times 8 = 32\) & mathematically equivalent \\
-Max sequence length & default 2048; some later runs use 1536 & 3600 & bounded concession \\
-Seeds & one seed, 42 & multi-seed average & major limitation \\
-Eval episodes & 200 & 500 & higher evaluation variance \\
-\bottomrule
-\end{tabularx}
-\caption{Parameter alignment and hardware concessions relative to the RAGEN baseline.}
-\label{tab:alignment}
-\end{table*}
+The main deviations are hardware-driven: AdamW8bit replaces fp32 AdamW, native batched PyTorch rollout replaces vLLM, and later memory-pressure runs use \code{--max\_seq\_length 1536} instead of the code default 2048. The project also uses one seed rather than multi-seed averaging. These concessions limit the strength of absolute performance claims, so the analysis emphasizes large relative gaps and curve shapes. The full alignment table is in Appendix~\ref{sec:app_impl}.
 
-The \code{max\_seq\_length} detail is important. The code default remains 2048, and the first no-filter run was initially run with that default. Later filter-ratio runs encountered memory pressure after roughly 100 training steps and were run with \code{--max\_seq\_length 1536}. Since observed trajectories were usually below 1536 tokens, this is treated as a bounded concession rather than a change that explains the main group ordering.
+\subsection{Evaluation Protocol}
 
-\subsection{Evaluation Protocol and Metrics}
+Evaluation runs every 20 training steps for 200 episodes. Environment seeds are sampled by the training process RNG rather than fixed to the same prompt set across steps, and evaluation keeps the agent's sampling configuration rather than forcing greedy decoding.
 
-Evaluation runs every 20 training steps for 200 episodes. Evaluation environment seeds are sampled by the training process RNG rather than fixed to an identical prompt set across steps. Evaluation also respects the agent sampling configuration instead of forcing temperature zero.
-
-The main metrics are:
-
-\begin{itemize}
-\item \textbf{Average reward}: mean cumulative environment reward, excluding the format penalty.
-\item \textbf{Success rate}: strict task completion, using environment success fields when available.
-\item \textbf{Format compliance}: fraction of turns matching the required think/answer output format.
-\item \textbf{Action validity and effectiveness}: turn-level action parsing and usefulness rates.
-\item \textbf{Reward variance}: trajectory-level reward variance, used for echo-trap diagnostics.
-\end{itemize}
-
-The analysis emphasizes average reward, success rate, format compliance, entropy, KL penalty, gradient norm, and the number of gradient steps per training iteration.
+The main metrics are average environment reward, success rate, format compliance, action validity, action effectiveness, and trajectory-level reward variance. The main text focuses on reward, success, format compliance, entropy, KL penalty, gradient norm, and the number of gradient steps per update.

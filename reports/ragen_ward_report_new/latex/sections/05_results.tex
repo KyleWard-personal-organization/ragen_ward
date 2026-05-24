@@ -1,4 +1,4 @@
-\section{Main Results and Analysis}
+\section{Results and Analysis}
 \label{sec:results}
 
 \subsection{Main Results}
@@ -41,7 +41,7 @@ Supplementary success, format, and multi-metric curves are moved to Appendix~\re
 
 \subsection{Why Filtering Helps PPO but Hurts GRPO}
 
-The mechanism has three parts.
+To explain why the same variance filter helps PPO but hurts GRPO, I separate the mechanism into three parts: whether high-variance groups improve critic learning, how costly sample removal is for each algorithm, and when aggressive filtering degenerates into a single-mini-batch update.
 
 \paragraph{Critic-data selection exists only in PPO.}
 For PPO, high-variance prompts provide useful value-function targets. The same prompt can produce trajectories with different returns, so the critic receives informative state-return contrasts. Better critic targets improve advantage estimates and can stabilize the actor update. Variance filtering therefore acts partly as data selection for the critic.
