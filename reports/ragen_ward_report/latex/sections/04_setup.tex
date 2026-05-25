@@ -1,9 +1,13 @@
-\section{Experimental Setup}
+\section{Experiments}
 \label{sec:setup}
 
-\subsection{Experiment Matrix}
+\subsection{Benchmarks and Baselines}
 
-The experiments form a \(2 \times 3\) matrix over algorithm and variance-filter ratio.
+\paragraph{Benchmarks.}
+All experiments are conducted on FrozenLake-v1~\citep{brockman2016gym}, the sparse grid-navigation benchmark used by the RAGEN 0.5B FrozenLake baseline. The wrapper follows the RAGEN-style text-agent protocol: each policy response must contain a formatted reasoning/action answer, the environment parses the action, and invalid response format receives the configured format penalty. The underlying Gymnasium environment is made RAGEN-compatible through randomized \(4\times4\) maps and slippery transitions with probabilities \(0.8/0.1/0.1\).
+
+\paragraph{Baseline.}
+The baseline for alignment is the RAGEN small-model StarPO/PPO setting on FrozenLake. This report keeps that PPO baseline and adds GRPO as a critic-free actor-only comparison. The resulting experiment matrix crosses the update algorithm with variance-filter ratio.
 
 \begin{table}[t]
 \centering
@@ -24,16 +28,12 @@ The experiments form a \(2 \times 3\) matrix over algorithm and variance-filter 
 \label{tab:matrix}
 \end{table}
 
-All runs train for 200 steps with seed 42, Qwen2.5-0.5B-Instruct~\citep{yang2024qwen25}, FrozenLake-v1~\citep{brockman2016gym}, sparse reward, randomized \(4\times4\) maps, and RAGEN-aligned slippery transitions \(0.8/0.1/0.1\). Each training step samples \(P=8\) prompts and \(K=16\) rollouts per prompt, giving 128 trajectories before filtering.
+\subsection{Implementation Details}
 
-\subsection{Baseline Alignment}
-
-The core algorithmic settings follow the RAGEN 0.5B FrozenLake baseline: actor learning rate \(10^{-6}\), critic learning rate \(10^{-5}\), KL coefficient 0.001, entropy coefficient 0.001, PPO clip ratio 0.2, value-loss coefficient 1.0, \(\gamma=1.0\), \(\lambda=1.0\), turn-level discount 0.95, format penalty \(-0.1\), and effective mini-batch size 32.
+All runs train for 200 steps with seed 42 and Qwen2.5-0.5B-Instruct~\citep{yang2024qwen25}. Each training step samples \(P=8\) prompts and \(K=16\) rollouts per prompt, giving 128 trajectories before filtering. Evaluation runs every 20 training steps for 200 episodes. The core algorithmic settings follow the RAGEN 0.5B FrozenLake baseline: actor learning rate \(10^{-6}\), critic learning rate \(10^{-5}\), KL coefficient 0.001, entropy coefficient 0.001, PPO clip ratio 0.2, value-loss coefficient 1.0, \(\gamma=1.0\), \(\lambda=1.0\), turn-level discount 0.95, format penalty \(-0.1\), and effective mini-batch size 32.
 
 The main deviations are hardware-driven: AdamW8bit replaces fp32 AdamW, native batched PyTorch rollout replaces vLLM, and later memory-pressure runs use \code{--max\_seq\_length 1536} instead of the code default 2048. The project also uses one seed rather than multi-seed averaging. These concessions limit the strength of absolute performance claims, so the analysis emphasizes large relative gaps and curve shapes. The full alignment table is in Appendix~\ref{sec:app_impl}.
 
-\subsection{Evaluation Protocol}
+\subsection{Evaluation Metrics}
 
-Evaluation runs every 20 training steps for 200 episodes. Environment seeds are sampled by the training process RNG rather than fixed to the same prompt set across steps, and evaluation keeps the agent's sampling configuration rather than forcing greedy decoding.
-
-The main metrics are average environment reward, success rate, format compliance, action validity, action effectiveness, and trajectory-level reward variance. The main text focuses on reward, success, format compliance, entropy, KL penalty, gradient norm, and the number of gradient steps per update.
+The main evaluation metrics are average environment reward, success rate, format compliance, action validity, action effectiveness, and trajectory-level reward variance. Average reward and success rate measure task performance; format compliance and action validity diagnose whether the model remains inside the text-action protocol; action effectiveness measures whether parsed actions produce valid state transitions. The analysis also uses training-side entropy, KL penalty, gradient norm, and the number of gradient steps per update to interpret failure modes and optimizer behavior.

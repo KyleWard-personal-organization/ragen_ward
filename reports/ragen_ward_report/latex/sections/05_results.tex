@@ -1,4 +1,4 @@
-\section{Main Results and Analysis}
+\section{Results and Analysis}
 \label{sec:results}
 
 \subsection{Main Results}
@@ -41,7 +41,7 @@ Supplementary success, format, and multi-metric curves are moved to Appendix~\re
 
 \subsection{Why Filtering Helps PPO but Hurts GRPO}
 
-The mechanism has three parts.
+To explain why the same variance filter helps PPO but hurts GRPO, I separate the mechanism into three parts: whether high-variance groups improve critic learning, how costly sample removal is for each algorithm, and when aggressive filtering degenerates into a single-mini-batch update.
 
 \paragraph{Critic-data selection exists only in PPO.}
 For PPO, high-variance prompts provide useful value-function targets. The same prompt can produce trajectories with different returns, so the critic receives informative state-return contrasts. Better critic targets improve advantage estimates and can stabilize the actor update. Variance filtering therefore acts partly as data selection for the critic.
@@ -67,4 +67,4 @@ GRPO vanilla has the opposite shape. Its entropy decreases while reward, success
 
 \subsection{Quantization and Algorithm Scale}
 
-The PPO runs have pre-clip gradient norms in the hundreds or thousands, while GRPO remains around \(0.05\)--\(0.16\). This matches the different advantage scales: PPO's bi-level GAE can produce large token-level weights, while GRPO z-scores are naturally bounded. Since AdamW8bit introduces block-wise optimizer-state quantization noise~\citep{dettmers2022optimizers}, PPO's larger update scale and critic coupling may be more sensitive to numerical drift. GRPO provides a useful contrast: it uses the same hardware concessions but avoids the critic and uses smaller advantages, and it is the only configuration that learns robustly in this setting.
+The PPO runs have pre-clip gradient norms in the hundreds or thousands, while GRPO remains around \(0.05\)--\(0.16\). This matches the different advantage scales: PPO's bi-level GAE can produce large token-level weights, while GRPO z-scores are naturally bounded. Since AdamW8bit introduces block-wise optimizer-state quantization noise~\citep{dettmers2022optimizers}, PPO's larger update scale and critic coupling may be more sensitive to numerical drift. GRPO provides a useful contrast: it uses the same hardware concessions but avoids the critic and uses smaller advantages, and it is the only configuration that learns robustly in this setting. More results can be found in Appendix~\ref{sec:app_figs}, including evaluation-outcome curves and stepwise metrics, the filter trade-off with update-count diagnostics, and failure-mode figures covering head-to-head comparisons, entropy, KL/gradient behavior, and the echo-trap proxy.

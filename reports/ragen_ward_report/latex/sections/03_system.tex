@@ -1,9 +1,7 @@
-\section{Method and System Design}
+\section{Method}
 \label{sec:system}
 
 \subsection{Modular Rewrite}
-
-The codebase is organized around five modules with explicit contracts.
 
 \begin{table}[t]
 \centering
@@ -23,7 +21,7 @@ Module & Responsibility \\
 \label{tab:modules}
 \end{table}
 
-This design makes the six-run matrix a configuration-level controlled comparison. PPO and GRPO share the same environment implementation, agent interface, rollout machinery, logging, evaluation code, and seed. They differ mainly in the RL algorithm module and in whether a critic is present.
+The codebase is organized around five modules with explicit contracts. This design makes the six-run matrix a configuration-level controlled comparison. PPO and GRPO share the same environment implementation, agent interface, rollout machinery, logging, evaluation code, and seed. They differ mainly in the RL algorithm module and in whether a critic is present.
 
 \subsection{RAGEN-Compatible Rollout}
 

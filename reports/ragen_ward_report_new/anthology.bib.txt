@@ -1,6 +1,0 @@
-The full ACL Anthology BibTeX file is intentionally not included in this project.
-
-Reason:
-  The report cites only a small set of papers, all of which are listed in
-  latex/custom.bib. Omitting the large anthology bibliography keeps the
-  Overleaf project lighter and reduces BibTeX processing time.

@@ -7,14 +7,9 @@ RAGEN~\citep{wang2025ragen} studies this problem through State-Thinking-Actions-
 
 This project asks a narrower question: how much of the RAGEN training pipeline can be reproduced on a single consumer GPU, and what changes when the update algorithm is switched from PPO with a critic to critic-free GRPO? The implementation preserves the main RAGEN contracts, rewrites the system into modular components, and makes the hardware concessions explicit.
 
-\subsection{Contributions}
+The paper first reviews the necessary background on LLM-agent RL, PPO/GRPO, and StarPO-S filtering, then describes the implementation method, experimental benchmark, results, and limitations. Additional curves, detailed tables, implementation settings, and training commands are provided in the appendix. The contribution of this report is summarized as follows:
 
-\paragraph{Consumer-hardware reproduction.}
-\method{} rewrites the pipeline into five modules: environments, agents, RL algorithms, rollout/training, and evaluation. It adds an 8 GB VRAM optimization stack, including AdamW8bit with fp32 embedding states, gradient checkpointing, bf16 weights, micro-batching, KV-cache restoration for generation, batched rollout, and alive-only batch shrinking. These changes make 200-step 0.5B-model PPO and GRPO runs feasible on a single RTX 4070.
-
-\paragraph{Algorithmic boundary of variance filtering.}
-The project completes a \(2 \times 3\) experiment matrix over algorithm \(\in\) \{PPO, GRPO\} and variance-filter ratio \(\in \{1.0, 0.5, 0.25\}\). PPO directionally reproduces the RAGEN story: vanilla training collapses, moderate filtering mitigates collapse, and aggressive filtering becomes stagnant. GRPO reverses the pattern: vanilla GRPO is the strongest configuration. This suggests that variance filtering is not algorithm-agnostic; it helps PPO partly through critic-data selection, but does not transfer directly to actor-only GRPO.
-
-\subsection{Organization}
-
-The paper first gives the necessary background and system design, then presents the experiments in the conventional order: experimental setup, main results, and analysis. Supplementary curves, detailed tables, and training commands are moved to the appendix.
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Consumer-hardware reproduction.} \method{} rewrites the pipeline into five modules: environments, agents, RL algorithms, rollout/training, and evaluation. It adds an 8 GB VRAM optimization stack, including AdamW8bit with fp32 embedding states, gradient checkpointing, bf16 weights, micro-batching, KV-cache restoration for generation, batched rollout, and alive-only batch shrinking. These changes make 200-step 0.5B-model PPO and GRPO runs feasible on a single RTX 4070.
+    \item \textbf{Algorithmic boundary of variance filtering.} The project completes a \(2 \times 3\) experiment matrix over algorithm \(\in\) \{PPO, GRPO\} and variance-filter ratio \(\in \{1.0, 0.5, 0.25\}\). PPO directionally reproduces the RAGEN story: vanilla training collapses, moderate filtering mitigates collapse, and aggressive filtering becomes stagnant. GRPO reverses the pattern: vanilla GRPO is the strongest configuration. This suggests that variance filtering is not algorithm-agnostic; it helps PPO partly through critic-data selection, but does not transfer directly to actor-only GRPO.
+\end{itemize}
